@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -76,6 +77,20 @@ SENSITIVE_FIELD_NAMES = {
     "secret",
     "private_key",
 }
+
+
+DEFAULT_SNAPSHOT_SECTIONS = [
+    "workflows",
+    "workflow_details",
+    "webhooks",
+    "builds",
+    "build_templates",
+    "build_template_references",
+    "services",
+    "environments",
+]
+
+KNOWN_SNAPSHOT_SECTIONS = set(DEFAULT_SNAPSHOT_SECTIONS)
 
 
 def is_sensitive_key(key: str) -> bool:
@@ -410,6 +425,27 @@ def summarize_webhook(item: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in summary.items() if value not in (None, {}, [])}
 
 
+def normalize_snapshot_sections(sections: list[str] | None) -> list[str]:
+    if not sections:
+        return list(DEFAULT_SNAPSHOT_SECTIONS)
+    normalized = []
+    for section in sections:
+        value = str(section).strip()
+        if not value:
+            continue
+        if value == "all":
+            return list(DEFAULT_SNAPSHOT_SECTIONS)
+        if value not in KNOWN_SNAPSHOT_SECTIONS:
+            raise ValueError(f"unknown snapshot section {value!r}; known sections: {sorted(KNOWN_SNAPSHOT_SECTIONS)}")
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def error_summary(exc: Exception) -> dict[str, str]:
+    return {"type": type(exc).__name__, "message": str(exc)}
+
+
 @mcp.tool()
 async def zadig_workflow_list(
     query: str = "",
@@ -482,6 +518,210 @@ async def zadig_workflow_update(
         json_body=payload,
     )
     return {"applied": True, "project_key": project, "workflow_name": workflow_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_project_snapshot(
+    project_key: str | None = None,
+    sections: list[str] | None = None,
+    workflow_names: list[str] | None = None,
+    max_workflows: int = 0,
+    include_workflow_raw_list: bool = False,
+) -> dict[str, Any]:
+    """Create a redacted project snapshot for audit/GitOps preparation."""
+    project = default_project(project_key)
+    selected_sections = normalize_snapshot_sections(sections)
+    snapshot: dict[str, Any] = {
+        "metadata": {
+            "project_key": project,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "sections": selected_sections,
+            "redacted": True,
+        },
+        "errors": [],
+    }
+
+    workflow_items: list[dict[str, Any]] = []
+    workflow_names_to_fetch: list[str] = []
+
+    if any(section in selected_sections for section in ("workflows", "workflow_details", "webhooks")):
+        try:
+            workflow_payload = await client().request("GET", "/openapi/workflows", project_key=project)
+            workflow_items = summarize_workflows(workflow_payload)
+            snapshot["workflows"] = {
+                "count": len(workflow_items),
+                "items": workflow_items,
+            }
+            if include_workflow_raw_list:
+                snapshot["workflows"]["raw"] = redact_sensitive(workflow_payload)
+        except Exception as exc:
+            snapshot["errors"].append({"section": "workflows", **error_summary(exc)})
+
+    if workflow_names:
+        workflow_names_to_fetch = [name for name in workflow_names if name]
+    else:
+        workflow_names_to_fetch = [str(item["name"]) for item in workflow_items if item.get("name")]
+
+    if max_workflows > 0:
+        workflow_names_to_fetch = workflow_names_to_fetch[:max_workflows]
+
+    if "workflow_details" in selected_sections:
+        details: dict[str, Any] = {}
+        for workflow_name in workflow_names_to_fetch:
+            try:
+                payload = await client().request(
+                    "GET",
+                    f"/openapi/workflows/custom/{path_name(workflow_name)}/detail",
+                    project_key=project,
+                )
+                details[workflow_name] = redact_sensitive(payload)
+            except Exception as exc:
+                snapshot["errors"].append(
+                    {"section": "workflow_details", "workflow_name": workflow_name, **error_summary(exc)}
+                )
+        snapshot["workflow_details"] = {
+            "count": len(details),
+            "items": details,
+        }
+
+    if "webhooks" in selected_sections:
+        webhooks: dict[str, Any] = {}
+        for workflow_name in workflow_names_to_fetch:
+            try:
+                webhook_payload = await client().request(
+                    "GET",
+                    "/api/aslan/workflow/v4/webhook",
+                    params={"projectName": project, "workflowName": workflow_name},
+                )
+                preset_payload = await client().request(
+                    "GET",
+                    "/api/aslan/workflow/v4/webhook/preset",
+                    params={"projectName": project, "workflowName": workflow_name},
+                )
+                webhook_items = webhook_items_from_payload(webhook_payload)
+                preset_items = webhook_items_from_payload(preset_payload)
+                webhooks[workflow_name] = {
+                    "webhook_count": len(webhook_items),
+                    "preset_count": len(preset_items),
+                    "webhook_items": [summarize_webhook(item) for item in webhook_items],
+                    "preset_items": [summarize_webhook(item) for item in preset_items],
+                    "raw": {
+                        "webhooks": redact_sensitive(webhook_payload),
+                        "preset": redact_sensitive(preset_payload),
+                    },
+                }
+            except Exception as exc:
+                snapshot["errors"].append({"section": "webhooks", "workflow_name": workflow_name, **error_summary(exc)})
+        snapshot["webhooks"] = {
+            "count": len(webhooks),
+            "items": webhooks,
+        }
+
+    if "builds" in selected_sections:
+        try:
+            build_payload = await client().request(
+                "GET",
+                "/openapi/build",
+                project_key=project,
+                params={"pageNum": 1, "pageSize": 200},
+            )
+            build_items = build_items_from_payload(build_payload)
+            snapshot["builds"] = {
+                "count": len(build_items),
+                "items": [summarize_build(item) for item in build_items],
+                "raw": redact_sensitive(build_payload),
+            }
+        except Exception as exc:
+            snapshot["errors"].append({"section": "builds", **error_summary(exc)})
+
+    template_items: list[dict[str, Any]] = []
+    if any(section in selected_sections for section in ("build_templates", "build_template_references")):
+        try:
+            template_payload = await client().request("GET", "/api/aslan/template/build")
+            template_items = build_template_items_from_payload(template_payload)
+            if "build_templates" in selected_sections:
+                template_details: dict[str, Any] = {}
+                for item in template_items:
+                    template_id = first_present(item, "id", "_id")
+                    template_name = first_present(item, "name", "template_name", "templateName")
+                    if not template_id:
+                        continue
+                    try:
+                        detail_payload = await client().request(
+                            "GET",
+                            f"/api/aslan/template/build/{path_name(str(template_id))}",
+                        )
+                        template_details[str(template_id)] = {
+                            "name": template_name,
+                            "detail": redact_sensitive(detail_payload),
+                        }
+                    except Exception as exc:
+                        snapshot["errors"].append(
+                            {
+                                "section": "build_templates",
+                                "template_id": str(template_id),
+                                "template_name": str(template_name or ""),
+                                **error_summary(exc),
+                            }
+                        )
+                snapshot["build_templates"] = {
+                    "count": len(template_details),
+                    "summary": [summarize_build_template(item) for item in template_items],
+                    "items": template_details,
+                }
+        except Exception as exc:
+            snapshot["errors"].append({"section": "build_templates", **error_summary(exc)})
+
+    if "build_template_references" in selected_sections and template_items:
+        references: dict[str, Any] = {}
+        for item in template_items:
+            template_id = first_present(item, "id", "_id")
+            template_name = first_present(item, "name", "template_name", "templateName")
+            if not template_id:
+                continue
+            try:
+                reference_payload = await client().request(
+                    "GET",
+                    f"/api/aslan/template/build/{path_name(str(template_id))}/reference",
+                )
+                references[str(template_id)] = {
+                    "name": template_name,
+                    "references": redact_sensitive(reference_payload),
+                }
+            except Exception as exc:
+                snapshot["errors"].append(
+                    {
+                        "section": "build_template_references",
+                        "template_id": str(template_id),
+                        "template_name": str(template_name or ""),
+                        **error_summary(exc),
+                    }
+                )
+        snapshot["build_template_references"] = {
+            "count": len(references),
+            "items": references,
+        }
+
+    if "services" in selected_sections:
+        try:
+            service_payload = await client().request("GET", f"{service_prefix(False)}/services", project_key=project)
+            snapshot["services"] = {
+                "count": len(summarize_services(service_payload)),
+                "summary": summarize_services(service_payload),
+                "raw": redact_sensitive(service_payload),
+            }
+        except Exception as exc:
+            snapshot["errors"].append({"section": "services", **error_summary(exc)})
+
+    if "environments" in selected_sections:
+        try:
+            env_payload = await client().request("GET", environment_prefix(False), project_key=project)
+            snapshot["environments"] = redact_sensitive(env_payload)
+        except Exception as exc:
+            snapshot["errors"].append({"section": "environments", **error_summary(exc)})
+
+    snapshot["metadata"]["error_count"] = len(snapshot["errors"])
+    return snapshot
 
 
 @mcp.tool()

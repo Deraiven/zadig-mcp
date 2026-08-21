@@ -7,6 +7,7 @@ Basic MCP server for Zadig OpenAPI.
 - `zadig_workflow_list`: list/search project workflows.
 - `zadig_workflow_get`: get one custom workflow detail.
 - `zadig_workflow_update`: update one custom workflow. Defaults to dry run and requires `confirm=true`.
+- `zadig_project_snapshot`: create a redacted project snapshot for audit/GitOps preparation.
 - `zadig_workflow_task_list`: list workflow tasks with deployment summaries.
 - `zadig_workflow_task_detail`: get one workflow task detail with deployment summaries.
 - `zadig_workflow_task_job_log`: get one workflow task job log, with tail and keyword filtering.
