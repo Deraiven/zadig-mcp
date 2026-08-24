@@ -142,7 +142,19 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
         )
 
     if "services" in snapshot:
-        write_data(project_dir / "services" / data_filename("index", output_format), snapshot["services"], output_format)
+        services = snapshot["services"] if isinstance(snapshot["services"], dict) else {}
+        service_index = {
+            key: value
+            for key, value in services.items()
+            if key not in {"details"}
+        }
+        write_data(project_dir / "services" / data_filename("index", output_format), service_index, output_format)
+        for service_name, detail in (services.get("details") or {}).items():
+            write_data(
+                project_dir / "services" / "items" / data_filename(safe_name(str(service_name)), output_format),
+                detail,
+                output_format,
+            )
 
     if "environments" in snapshot:
         write_data(

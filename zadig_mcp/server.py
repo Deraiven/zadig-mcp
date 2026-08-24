@@ -5,7 +5,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .client import ZadigAPIError, ZadigClient, default_project, environment_prefix, path_name, service_prefix
-from .service_ops import replace_container_image, summarize_services, unified_diff, upsert_variable
+from .service_ops import iter_services, replace_container_image, summarize_services, unified_diff, upsert_variable
 
 mcp = FastMCP("zadig")
 
@@ -475,6 +475,82 @@ def unsupported_project_section(name: str, reason: str) -> dict[str, Any]:
         "section": name,
         "reason": reason,
     }
+
+
+def service_index_item(service: dict[str, Any], project: str) -> dict[str, Any]:
+    service_name = service.get("service_name") or service.get("name") or ""
+    containers = service.get("containers") if isinstance(service.get("containers"), list) else []
+    return {
+        "name": service_name,
+        "project_key": project,
+        "type": service.get("type"),
+        "source": service.get("source"),
+        "production": False,
+        "file": f"items/{safe_file_name(str(service_name))}.yaml",
+        "container_count": len(containers),
+        "containers": [
+            {
+                "name": container.get("name", ""),
+                "image_name": container.get("image_name", ""),
+                "image": container.get("image", ""),
+            }
+            for container in containers
+            if isinstance(container, dict)
+        ],
+    }
+
+
+def safe_file_name(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in "._-" else "-" for char in value.strip())
+    return safe.strip("-") or "unnamed"
+
+
+def service_gitops_document(
+    project: str,
+    service_name: str,
+    list_item: dict[str, Any],
+    detail: dict[str, Any] | None,
+    template_name: str = "",
+) -> dict[str, Any]:
+    detail = detail or {}
+    containers = detail.get("containers") if isinstance(detail.get("containers"), list) else list_item.get("containers") or []
+    variables = detail.get("service_variable_kvs") if isinstance(detail.get("service_variable_kvs"), list) else []
+    resolved_template_name = detail.get("template_name") or template_name
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "Service",
+        "metadata": {
+            "project": project,
+            "name": service_name,
+            "production": False,
+        },
+        "spec": {
+            "type": detail.get("type") or list_item.get("type"),
+            "source": detail.get("source") or list_item.get("source"),
+            "template": {
+                "name": resolved_template_name,
+                "autoSync": False,
+                "valuesYaml": detail.get("values_yaml") or "",
+                "variables": variables,
+            },
+            "containers": containers,
+            "yaml": detail.get("yaml") or "",
+        },
+        "live": {
+            "list": list_item,
+            "detail": detail,
+        },
+    }
+
+
+def chart_template_items_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        value = payload.get("chartTemplates") or payload.get("chart_templates") or payload.get("items") or payload.get("data")
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
 
 
 def prepare_workflow_payload(
@@ -1015,10 +1091,73 @@ async def zadig_project_snapshot(
     if "services" in selected_sections:
         try:
             service_payload = await client().request("GET", f"{service_prefix(False)}/services", project_key=project)
+            service_items = iter_services(service_payload)
+            index_items = [service_index_item(item, project) for item in service_items]
+            service_details: dict[str, Any] = {}
+            service_items_by_name = {
+                str(item["name"]): item for item in index_items if item.get("name")
+            }
+            service_chart_templates: dict[str, str] = {}
+            try:
+                chart_payload = await client().request("GET", "/api/aslan/template/charts")
+                for chart_item in chart_template_items_from_payload(chart_payload):
+                    chart_name = first_present(chart_item, "name")
+                    if not chart_name:
+                        continue
+                    try:
+                        reference_payload = await client().request(
+                            "GET",
+                            f"/api/aslan/template/charts/{path_name(str(chart_name))}/reference",
+                        )
+                        for reference in payload_items(reference_payload):
+                            if not isinstance(reference, dict):
+                                continue
+                            if reference.get("project_name") != project:
+                                continue
+                            service_name = reference.get("service_name")
+                            if service_name:
+                                service_chart_templates[str(service_name)] = str(chart_name)
+                    except Exception as exc:
+                        snapshot["errors"].append(
+                            {
+                                "section": "service_chart_template_references",
+                                "template_name": str(chart_name),
+                                **error_summary(exc),
+                            }
+                        )
+            except Exception as exc:
+                snapshot["errors"].append({"section": "service_chart_templates", **error_summary(exc)})
+            for service_name, index_item in service_items_by_name.items():
+                try:
+                    detail_payload = await client().request(
+                        "GET",
+                        f"{service_prefix(False)}/{path_name(service_name)}",
+                        project_key=project,
+                    )
+                    detail = redact_sensitive(detail_payload)
+                    service_details[service_name] = service_gitops_document(
+                        project,
+                        service_name,
+                        index_item,
+                        detail,
+                        service_chart_templates.get(service_name, ""),
+                    )
+                except Exception as exc:
+                    snapshot["errors"].append(
+                        {"section": "service_details", "service_name": service_name, **error_summary(exc)}
+                    )
+                    service_details[service_name] = service_gitops_document(
+                        project,
+                        service_name,
+                        index_item,
+                        None,
+                        service_chart_templates.get(service_name, ""),
+                    )
             snapshot["services"] = {
-                "count": len(summarize_services(service_payload)),
+                "count": len(index_items),
+                "items": index_items,
+                "details": service_details,
                 "summary": summarize_services(service_payload),
-                "raw": redact_sensitive(service_payload),
             }
         except Exception as exc:
             snapshot["errors"].append({"section": "services", **error_summary(exc)})

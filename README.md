@@ -96,6 +96,7 @@ zadig-config/
     tests/index.yaml
     code-scans/index.yaml
     services/index.yaml
+    services/items/<service>.yaml
     environments/index.yaml
     releases/index.yaml
   templates/
@@ -120,6 +121,10 @@ resources.
 `_snapshot/errors.yaml` is not Zadig configuration. It records snapshot-time API
 failures or unsupported sections so GitOps reviewers can tell whether an export
 is complete.
+
+`services/index.yaml` is an inventory only. Per-service files under
+`services/items/` hold the live service detail and a GitOps-oriented `spec`
+section that later service CRUD apply commands can use.
 
 For a smaller export:
 
