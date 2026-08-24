@@ -78,8 +78,8 @@ def workflow_payload_from_file(path: Path) -> dict[str, Any]:
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
-    shared_template_dir = output_dir / "build-templates"
-    shared_template_reference_dir = output_dir / "build-template-references"
+    shared_template_dir = output_dir / "templates" / "build-templates"
+    shared_template_reference_dir = output_dir / "references" / "build-templates"
     write_data(project_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
     write_data(project_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
 

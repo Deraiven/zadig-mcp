@@ -78,11 +78,6 @@ The output layout is:
 
 ```text
 zadig-config/
-  build-templates/
-    index.yaml
-    <template>.<id>.yaml
-  build-template-references/
-    index.yaml
   projects/<project>/
     metadata.yaml
     errors.yaml
@@ -92,11 +87,24 @@ zadig-config/
     builds/index.yaml
     services/index.yaml
     environments/index.yaml
+  templates/
+    build-templates/
+      index.yaml
+      <template>.<id>.yaml
+    helm-charts/
+      <chart>/
+        Chart.yaml
+        values.yaml
+        templates/
+  references/
+    build-templates/
+      index.yaml
 ```
 
 Project snapshots only include build templates that are actually referenced by
-that project, and those templates are written at the top level because Zadig
-build templates are shared resources rather than project-owned resources.
+that project, and those templates are written under `templates/` because Zadig
+template-library resources are shared resources rather than project-owned
+resources.
 
 For a smaller export:
 
