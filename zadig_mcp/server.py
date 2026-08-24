@@ -95,6 +95,8 @@ KNOWN_SNAPSHOT_SECTIONS = set(DEFAULT_SNAPSHOT_SECTIONS)
 
 def is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in {"is_credential", "iscredential"}:
+        return False
     return lowered in SENSITIVE_FIELD_NAMES or any(
         marker in lowered for marker in ("token", "secret", "password", "credential", "private")
     )

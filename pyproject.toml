@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 zadig-mcp = "zadig_mcp.server:main"
+zadig-gitops = "zadig_mcp.gitops:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -56,3 +56,49 @@ task payload; credential-like fields are recursively redacted before returning.
 uv run python -m py_compile zadig_mcp/*.py
 uv run zadig-mcp
 ```
+
+## GitOps preparation
+
+`zadig-gitops snapshot` exports a redacted project snapshot into a stable file
+tree that is suitable for Git review and later PR-based change loops.
+
+```bash
+ZADIG_BASE_URL="https://zadigx.shub.us" \
+ZADIG_TOKEN="..." \
+uv run zadig-gitops snapshot \
+  --project fat \
+  --output ./zadig-config
+```
+
+The output layout is:
+
+```text
+zadig-config/
+  projects/<project>/
+    metadata.json
+    errors.json
+    workflows/index.json
+    workflows/details/<workflow>.json
+    webhooks/<workflow>.json
+    builds/index.json
+    build-templates/index.json
+    build-templates/<template>.<id>.json
+    build-template-references/index.json
+    services/index.json
+    environments/index.json
+```
+
+For a smaller export:
+
+```bash
+uv run zadig-gitops snapshot \
+  --project fat \
+  --section workflows \
+  --section workflow_details \
+  --section webhooks \
+  --workflow fat-pipelines \
+  --output ./zadig-config
+```
+
+Snapshot output is redacted by default. Credential-like fields and variables
+marked with `is_credential=true` are written as `***redacted***`.
