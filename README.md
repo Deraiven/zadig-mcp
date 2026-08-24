@@ -85,6 +85,7 @@ The output layout is:
 ```text
 zadig-config/
   projects/<project>/
+    project.yaml
     _snapshot/
       metadata.yaml
       errors.yaml
@@ -125,6 +126,10 @@ is complete.
 `services/index.yaml` is an inventory only. Per-service files under
 `services/items/` hold the live service detail and a GitOps-oriented `spec`
 section that later service CRUD apply commands can use.
+
+`project.yaml` is the top-level project document exported from live Zadig
+project metadata. It is currently read-only snapshot data plus a small
+GitOps-oriented `spec`.
 
 For a smaller export:
 
@@ -204,3 +209,20 @@ uv run zadig-gitops apply service \
 Service apply currently supports creating Helm `chartTemplate` services,
 deleting missing services with `--prune`, and updating supported mutable fields
 (`spec.yaml` and `spec.template.variables`) when Zadig exposes them.
+
+Plan project changes from `project.yaml`. Project apply is intentionally
+plan-only for now: create/update/delete modes only compare desired config with
+live Zadig state and never call mutating project APIs, even when `--confirm` is
+passed.
+
+```bash
+uv run zadig-gitops apply project \
+  --project bi \
+  --dir ./zadig-config/projects/bi
+```
+
+```bash
+uv run zadig-gitops apply project \
+  --project bi \
+  --mode delete
+```

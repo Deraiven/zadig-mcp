@@ -80,6 +80,7 @@ SENSITIVE_FIELD_NAMES = {
 
 
 DEFAULT_SNAPSHOT_SECTIONS = [
+    "project",
     "iterations",
     "workflows",
     "workflow_details",
@@ -349,7 +350,7 @@ def filter_log_text(log_text: str, keyword: str = "", tail_lines: int = 300) -> 
 
 
 def json_for_diff(value: Any) -> str:
-    return json.dumps(redact_sensitive(value), ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(redact_sensitive(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 def webhook_items_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -465,6 +466,162 @@ def payload_items(payload: Any) -> list[Any]:
                 if nested:
                     return nested
     return []
+
+
+def project_items_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        for key in ("projects", "items", "list", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = project_items_from_payload(value)
+                if nested:
+                    return nested
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def project_key_from_item(item: dict[str, Any]) -> str:
+    return str(
+        first_present(
+            item,
+            "project_key",
+            "projectKey",
+            "name",
+            "project_name",
+            "projectName",
+            "key",
+        )
+        or ""
+    )
+
+
+def summarize_project(item: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        "project_key": project_key_from_item(item),
+        "name": first_present(item, "name", "project_name", "projectName"),
+        "display_name": first_present(item, "display_name", "displayName"),
+        "type": first_present(item, "type", "project_type", "projectType"),
+        "desc": first_present(item, "desc", "description"),
+        "is_public": first_present(item, "is_public", "isPublic", "public"),
+        "create_time": first_present(item, "create_time", "createTime", "created_at", "createdAt"),
+        "update_time": first_present(item, "update_time", "updateTime", "updated_at", "updatedAt"),
+        "created_by": first_present(item, "created_by", "createdBy", "creator"),
+        "updated_by": first_present(item, "updated_by", "updatedBy", "update_by", "updateBy"),
+    }
+    return {key: value for key, value in summary.items() if value not in (None, "", [], {})}
+
+
+def project_gitops_document(project: str, live_item: dict[str, Any] | None = None) -> dict[str, Any]:
+    live_item = live_item or {}
+    summary = summarize_project(live_item) if live_item else {"project_key": project}
+    name = summary.get("project_key") or project
+    spec = {
+        "name": summary.get("name") or name,
+        "displayName": summary.get("display_name"),
+        "type": summary.get("type"),
+        "description": summary.get("desc"),
+        "isPublic": summary.get("is_public"),
+    }
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "Project",
+        "metadata": {
+            "name": name,
+            "projectKey": project,
+        },
+        "spec": {key: value for key, value in spec.items() if value not in (None, "", [], {})},
+        "live": {
+            "summary": summary,
+            "raw": redact_sensitive(live_item),
+        },
+    }
+
+
+async def fetch_project_item(project: str) -> dict[str, Any] | None:
+    payload = await client().request("GET", "/openapi/projects/project")
+    for item in project_items_from_payload(payload):
+        if project_key_from_item(item) == project:
+            return item
+    return None
+
+
+async def fetch_project_document(project: str) -> dict[str, Any] | None:
+    item = await fetch_project_item(project)
+    if item is None:
+        return None
+    return project_gitops_document(project, item)
+
+
+def project_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    name = metadata.get("projectKey") or metadata.get("name") or spec.get("name")
+    if not name:
+        raise ValueError("project document must contain metadata.projectKey or metadata.name")
+    return str(name)
+
+
+async def zadig_project_apply_plan(
+    project_document: dict[str, Any] | None = None,
+    project_key: str | None = None,
+    mode: str = "auto",
+) -> dict[str, Any]:
+    """Plan project create/update/delete only. This function never mutates Zadig."""
+    if mode not in {"auto", "create", "update", "delete"}:
+        raise ValueError("mode must be one of: auto, create, update, delete")
+
+    desired_project = project_key or ""
+    if project_document:
+        desired_project = project_name_from_document(project_document)
+        if project_key and desired_project != project_key:
+            raise ValueError(
+                f"project document targets {desired_project!r}, but --project/project_key is {project_key!r}"
+            )
+    else:
+        desired_project = default_project(project_key)
+
+    live_document = await fetch_project_document(desired_project)
+    exists = live_document is not None
+    desired = {} if mode == "delete" else project_document or project_gitops_document(desired_project)
+
+    if mode == "delete":
+        action = "delete" if exists else "none"
+        reason = "project exists and would be deleted" if exists else "project does not exist"
+    elif not exists:
+        action = "create" if mode in {"auto", "create"} else "blocked"
+        reason = "project does not exist" if action == "create" else "project does not exist; update is not possible"
+    elif mode == "create":
+        action = "blocked"
+        reason = "project already exists; create is not possible"
+    else:
+        current_spec = live_document.get("spec", {}) if isinstance(live_document, dict) else {}
+        desired_spec = desired.get("spec", {}) if isinstance(desired.get("spec"), dict) else {}
+        action = "update" if current_spec != desired_spec else "none"
+        reason = "project spec differs" if action == "update" else "project exists and spec matches"
+
+    return {
+        "applied": False,
+        "dry_run": True,
+        "mutation_supported": False,
+        "reason": "project apply is plan-only; create/update/delete API calls are intentionally not implemented yet",
+        "project_key": desired_project,
+        "entity": "project",
+        "exists": exists,
+        "mode": mode,
+        "action": action,
+        "action_reason": reason,
+        "diff": unified_diff(
+            json_for_diff(live_document or {}),
+            json_for_diff(desired),
+            f"{desired_project}:current",
+            f"{desired_project}:desired",
+        ),
+        "desired": redact_sensitive(desired),
+        "live": redact_sensitive(live_document),
+    }
 
 
 def unsupported_project_section(name: str, reason: str) -> dict[str, Any]:
@@ -610,6 +767,34 @@ async def workflow_exists(project: str, workflow_name: str) -> bool:
             return False
         raise
         return False
+
+
+@mcp.tool()
+async def zadig_project_get(project_key: str | None = None) -> dict[str, Any]:
+    """Get one Zadig project as a redacted GitOps Project document."""
+    project = default_project(project_key)
+    document = await fetch_project_document(project)
+    if document is None:
+        return {
+            "project_key": project,
+            "exists": False,
+            "document": project_gitops_document(project),
+        }
+    return {
+        "project_key": project,
+        "exists": True,
+        "document": document,
+    }
+
+
+@mcp.tool()
+async def zadig_project_plan(
+    project: dict[str, Any] | None = None,
+    project_key: str | None = None,
+    mode: str = "auto",
+) -> dict[str, Any]:
+    """Plan Zadig project create/update/delete. This is always dry-run and never mutates."""
+    return await zadig_project_apply_plan(project_document=project, project_key=project_key, mode=mode)
 
 
 @mcp.tool()
@@ -880,6 +1065,22 @@ async def zadig_project_snapshot(
 
     workflow_items: list[dict[str, Any]] = []
     workflow_names_to_fetch: list[str] = []
+
+    if "project" in selected_sections:
+        try:
+            project_item = await fetch_project_item(project)
+            snapshot["project"] = project_gitops_document(project, project_item)
+            if project_item is None:
+                snapshot["errors"].append(
+                    {
+                        "section": "project",
+                        "type": "NotFound",
+                        "message": f"project {project!r} was not found in /openapi/projects/project",
+                    }
+                )
+        except Exception as exc:
+            snapshot["project"] = project_gitops_document(project)
+            snapshot["errors"].append({"section": "project", **error_summary(exc)})
 
     if any(section in selected_sections for section in ("workflows", "workflow_details", "webhooks")):
         try:

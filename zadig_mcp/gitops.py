@@ -13,6 +13,7 @@ from .server import (
     assert_no_redacted_placeholders,
     client,
     zadig_project_snapshot,
+    zadig_project_apply_plan,
     zadig_workflow_apply,
     zadig_workflow_diff,
 )
@@ -90,6 +91,15 @@ def service_document_from_file(path: Path) -> dict[str, Any]:
         raise ValueError(f"service file {path} must contain a mapping")
     if data.get("kind") != "Service":
         raise ValueError(f"service file {path} must have kind: Service")
+    return data
+
+
+def project_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"project file {path} must contain a mapping")
+    if data.get("kind") != "Project":
+        raise ValueError(f"project file {path} must have kind: Project")
     return data
 
 
@@ -299,6 +309,9 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     write_data(snapshot_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
     write_data(snapshot_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
 
+    if "project" in snapshot:
+        write_data(project_dir / data_filename("project", output_format), snapshot["project"], output_format)
+
     if "iterations" in snapshot:
         write_data(project_dir / "iterations" / data_filename("index", output_format), snapshot["iterations"], output_format)
 
@@ -400,6 +413,11 @@ async def run_snapshot(args: argparse.Namespace) -> None:
 
 
 async def run_apply(args: argparse.Namespace) -> None:
+    if args.entity == "project":
+        result = await run_apply_project(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
     if args.entity == "service":
         result = await run_apply_service(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
@@ -432,6 +450,36 @@ async def run_apply(args: argparse.Namespace) -> None:
         allow_redacted=args.allow_redacted,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def resolve_project_file(args: argparse.Namespace) -> Path | None:
+    if args.file:
+        return Path(args.file).expanduser().resolve()
+    if args.dir:
+        return Path(args.dir).expanduser().resolve() / "project.yaml"
+    return None
+
+
+async def run_apply_project(args: argparse.Namespace) -> dict[str, Any]:
+    project_file = resolve_project_file(args)
+    project_document = None
+    if args.mode != "delete":
+        if project_file is None:
+            raise ValueError("--file or --dir is required for project create/update plan")
+        if not project_file.is_file():
+            raise ValueError(f"project file not found: {project_file}")
+        project_document = project_document_from_file(project_file)
+    elif project_file is not None and project_file.is_file():
+        project_document = project_document_from_file(project_file)
+
+    result = await zadig_project_apply_plan(
+        project_document=project_document,
+        project_key=args.project,
+        mode=args.mode,
+    )
+    result["file"] = str(project_file) if project_file else None
+    result["confirm_ignored"] = bool(args.confirm)
+    return result
 
 
 async def run_apply_service(args: argparse.Namespace) -> dict[str, Any]:
@@ -519,14 +567,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.set_defaults(func=run_snapshot)
 
-    apply = subparsers.add_parser("apply", help="Apply Zadig workflow or service configuration from YAML/JSON.")
-    apply.add_argument("entity", nargs="?", choices=["workflow", "service"], default="workflow", help="Entity type to apply.")
+    apply = subparsers.add_parser("apply", help="Apply Zadig workflow/service configuration, or plan project changes.")
+    apply.add_argument(
+        "entity",
+        nargs="?",
+        choices=["workflow", "service", "project"],
+        default="workflow",
+        help="Entity type to apply or plan.",
+    )
     apply.add_argument("--project", required=True, help="Zadig project key.")
     apply.add_argument("--workflow", help="Workflow name. Defaults to workflow_name/workflow_key/name from file.")
     apply.add_argument("--service", help="Service name filter for service apply.")
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
     apply.add_argument("--dir", help="Directory containing service item YAML files, usually projects/<project>/services.")
-    apply.add_argument("--mode", choices=["auto", "create", "update"], default="auto", help="Apply mode.")
+    apply.add_argument("--mode", choices=["auto", "create", "update", "delete"], default="auto", help="Apply mode.")
     apply.add_argument("--prune", action="store_true", help="For service apply, delete live services missing from desired files.")
     apply.add_argument(
         "--production",
