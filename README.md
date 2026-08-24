@@ -173,3 +173,34 @@ uv run zadig-gitops apply \
 Real apply rejects files that still contain `***redacted***` placeholders by
 default. Replace the placeholder values before applying, or pass
 `--allow-redacted` only when the target fields are intentionally redacted-safe.
+
+Apply service desired state from per-service YAML files. This is also dry-run
+unless `--confirm` is set.
+
+```bash
+uv run zadig-gitops apply service \
+  --project bi \
+  --file ./zadig-config/projects/bi/services/items/product-insights.yaml
+```
+
+Apply all service files in a project:
+
+```bash
+uv run zadig-gitops apply service \
+  --project bi \
+  --dir ./zadig-config/projects/bi/services
+```
+
+Delete live services that are missing from the desired service directory:
+
+```bash
+uv run zadig-gitops apply service \
+  --project bi \
+  --dir ./zadig-config/projects/bi/services \
+  --prune \
+  --confirm
+```
+
+Service apply currently supports creating Helm `chartTemplate` services,
+deleting missing services with `--prune`, and updating supported mutable fields
+(`spec.yaml` and `spec.template.variables`) when Zadig exposes them.

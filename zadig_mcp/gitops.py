@@ -7,7 +7,16 @@ from typing import Any
 
 import yaml
 
-from .server import DEFAULT_SNAPSHOT_SECTIONS, zadig_project_snapshot, zadig_workflow_apply, zadig_workflow_diff
+from .client import ZadigAPIError, path_name, service_prefix
+from .server import (
+    DEFAULT_SNAPSHOT_SECTIONS,
+    assert_no_redacted_placeholders,
+    client,
+    zadig_project_snapshot,
+    zadig_workflow_apply,
+    zadig_workflow_diff,
+)
+from .service_ops import iter_services
 
 
 class LiteralString(str):
@@ -73,6 +82,212 @@ def workflow_payload_from_file(path: Path) -> dict[str, Any]:
     if isinstance(detail, dict):
         return detail
     return data
+
+
+def service_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"service file {path} must contain a mapping")
+    if data.get("kind") != "Service":
+        raise ValueError(f"service file {path} must have kind: Service")
+    return data
+
+
+def service_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    name = metadata.get("name") or document.get("service_name")
+    if not name:
+        raise ValueError("service document must contain metadata.name")
+    return str(name)
+
+
+def service_production_from_document(document: dict[str, Any]) -> bool:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    return bool(metadata.get("production", False))
+
+
+def service_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    if not spec:
+        raise ValueError("service document must contain spec")
+    return spec
+
+
+def service_create_payload(project: str, service_name: str, spec: dict[str, Any], production: bool) -> tuple[str, dict[str, Any]]:
+    service_type = spec.get("type") or "helm"
+    source = spec.get("source") or ""
+    template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+
+    if service_type == "helm" and source == "chartTemplate":
+        template_name = template.get("name")
+        if not template_name:
+            raise ValueError(f"helm chartTemplate service {service_name!r} requires spec.template.name")
+        return (
+            "/openapi/service/template/load/helm",
+            {
+                "project_key": project,
+                "service_name": service_name,
+                "production": production,
+                "template_name": template_name,
+                "values_yaml": template.get("valuesYaml") or template.get("values_yaml") or "",
+                "variables": template.get("variables") or [],
+                "auto_sync": bool(template.get("autoSync", False)),
+            },
+        )
+
+    yaml_text = spec.get("yaml") or ""
+    if not yaml_text:
+        raise ValueError(f"service {service_name!r} requires spec.yaml for non-template create/update")
+    return (
+        service_prefix(production),
+        {
+            "service_name": service_name,
+            "type": service_type,
+            "yaml": yaml_text,
+        },
+    )
+
+
+def desired_service_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file())
+
+
+async def live_service_names(project: str, production: bool) -> set[str]:
+    payload = await client().request("GET", f"{service_prefix(production)}/services", project_key=project)
+    return {
+        str(item.get("service_name") or item.get("name"))
+        for item in iter_services(payload)
+        if item.get("service_name") or item.get("name")
+    }
+
+
+async def live_service_detail(project: str, service_name: str, production: bool) -> dict[str, Any] | None:
+    try:
+        payload = await client().request(
+            "GET",
+            f"{service_prefix(production)}/{path_name(service_name)}",
+            project_key=project,
+        )
+        return payload if isinstance(payload, dict) else {}
+    except ZadigAPIError as exc:
+        if "no documents in result" in str(exc) or "HTTP 404" in str(exc):
+            return None
+        raise
+
+
+def plan_service_update(service_name: str, spec: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
+    yaml_text = spec.get("yaml") or ""
+    template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+    variables_present = "variables" in template
+    variables = template.get("variables") if isinstance(template.get("variables"), list) else []
+
+    actions: list[dict[str, Any]] = []
+    if yaml_text and yaml_text != (live.get("yaml") or ""):
+        actions.append({"action": "update_yaml", "service_name": service_name})
+    live_variables = live.get("service_variable_kvs") if isinstance(live.get("service_variable_kvs"), list) else []
+    if variables_present and variables != live_variables:
+        actions.append({"action": "update_variables", "service_name": service_name})
+
+    if not actions:
+        return {
+            "action": "none",
+            "service_name": service_name,
+            "reason": "service exists and no supported mutable fields changed",
+        }
+    return {"action": "update", "service_name": service_name, "steps": actions}
+
+
+async def apply_service_document(
+    project: str,
+    path: Path,
+    *,
+    dry_run: bool,
+    confirm: bool,
+    allow_redacted: bool,
+) -> dict[str, Any]:
+    document = service_document_from_file(path)
+    if confirm and not dry_run:
+        assert_no_redacted_placeholders(document, allow_redacted)
+    service_name = service_name_from_document(document)
+    production = service_production_from_document(document)
+    spec = service_spec_from_document(document)
+    live = await live_service_detail(project, service_name, production)
+
+    if live is None:
+        endpoint, payload = service_create_payload(project, service_name, spec, production)
+        result = {
+            "file": str(path),
+            "service_name": service_name,
+            "production": production,
+            "action": "create",
+            "endpoint": endpoint,
+            "payload": payload,
+            "applied": False,
+            "dry_run": dry_run,
+        }
+        if dry_run or not confirm:
+            return result
+        result["result"] = await client().request("POST", endpoint, project_key=project, json_body=payload)
+        result["applied"] = True
+        return result
+
+    update_plan = plan_service_update(service_name, spec, live)
+    result = {
+        "file": str(path),
+        "service_name": service_name,
+        "production": production,
+        "action": update_plan["action"],
+        "plan": update_plan,
+        "applied": False,
+        "dry_run": dry_run,
+    }
+    if update_plan["action"] == "none" or dry_run or not confirm:
+        return result
+
+    applied_steps = []
+    for step in update_plan.get("steps", []):
+        if step["action"] == "update_yaml":
+            response = await client().request(
+                "PUT",
+                f"{service_prefix(production)}/{path_name(service_name)}",
+                project_key=project,
+                json_body={"type": spec.get("type") or live.get("type") or "k8s", "yaml": spec.get("yaml") or ""},
+            )
+            applied_steps.append({"action": "update_yaml", "result": response})
+        elif step["action"] == "update_variables":
+            template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+            response = await client().request(
+                "PUT",
+                f"{service_prefix(production)}/{path_name(service_name)}/variable",
+                project_key=project,
+                json_body={"service_variable_kvs": template.get("variables") or []},
+            )
+            applied_steps.append({"action": "update_variables", "result": response})
+    result["applied"] = bool(applied_steps)
+    result["result"] = applied_steps
+    return result
+
+
+async def delete_service(project: str, service_name: str, production: bool, *, dry_run: bool, confirm: bool) -> dict[str, Any]:
+    result = {
+        "service_name": service_name,
+        "production": production,
+        "action": "delete",
+        "applied": False,
+        "dry_run": dry_run,
+    }
+    if dry_run or not confirm:
+        return result
+    result["result"] = await client().request(
+        "DELETE",
+        f"{service_prefix(production)}/{path_name(service_name)}",
+        project_key=project,
+    )
+    result["applied"] = True
+    return result
 
 
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
@@ -185,6 +400,13 @@ async def run_snapshot(args: argparse.Namespace) -> None:
 
 
 async def run_apply(args: argparse.Namespace) -> None:
+    if args.entity == "service":
+        result = await run_apply_service(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if not args.file:
+        raise ValueError("--file is required for workflow apply")
     workflow_file = Path(args.file).expanduser().resolve()
     workflow = workflow_payload_from_file(workflow_file)
     workflow_name = args.workflow or workflow.get("workflow_name") or workflow.get("workflow_key") or workflow.get("name")
@@ -212,6 +434,67 @@ async def run_apply(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+async def run_apply_service(args: argparse.Namespace) -> dict[str, Any]:
+    project = args.project
+    if not args.file and not args.dir:
+        raise ValueError("--file or --dir is required for service apply")
+    if args.prune and not args.dir:
+        raise ValueError("--prune requires --dir so the desired service set is explicit")
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    files = desired_service_files(target_path)
+    if not files:
+        raise ValueError(f"no service YAML files found under {target_path}")
+
+    results = []
+    desired_by_production: dict[bool, set[str]] = {}
+    for service_file in files:
+        document = service_document_from_file(service_file)
+        service_name = service_name_from_document(document)
+        production = service_production_from_document(document)
+        desired_by_production.setdefault(production, set()).add(service_name)
+        if args.service and service_name != args.service:
+            continue
+        results.append(
+            await apply_service_document(
+                project,
+                service_file,
+                dry_run=not args.confirm,
+                confirm=args.confirm,
+                allow_redacted=args.allow_redacted,
+            )
+        )
+
+    prune_results = []
+    if args.prune:
+        productions = [args.production] if args.production is not None else sorted(desired_by_production)
+        for production in productions:
+            desired_names = desired_by_production.get(production, set())
+            for live_name in sorted(await live_service_names(project, production)):
+                if args.service and live_name != args.service:
+                    continue
+                if live_name in desired_names:
+                    continue
+                prune_results.append(
+                    await delete_service(
+                        project,
+                        live_name,
+                        production,
+                        dry_run=not args.confirm,
+                        confirm=args.confirm,
+                    )
+                )
+
+    return {
+        "project_key": project,
+        "entity": "service",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "desired_file_count": len(files),
+        "results": results,
+        "prune_results": prune_results,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zadig-gitops", description="GitOps helpers for Zadig configuration.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -236,11 +519,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.set_defaults(func=run_snapshot)
 
-    apply = subparsers.add_parser("apply", help="Create or update a Zadig workflow from YAML/JSON.")
+    apply = subparsers.add_parser("apply", help="Apply Zadig workflow or service configuration from YAML/JSON.")
+    apply.add_argument("entity", nargs="?", choices=["workflow", "service"], default="workflow", help="Entity type to apply.")
     apply.add_argument("--project", required=True, help="Zadig project key.")
     apply.add_argument("--workflow", help="Workflow name. Defaults to workflow_name/workflow_key/name from file.")
-    apply.add_argument("--file", required=True, help="Workflow YAML/JSON file.")
+    apply.add_argument("--service", help="Service name filter for service apply.")
+    apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
+    apply.add_argument("--dir", help="Directory containing service item YAML files, usually projects/<project>/services.")
     apply.add_argument("--mode", choices=["auto", "create", "update"], default="auto", help="Apply mode.")
+    apply.add_argument("--prune", action="store_true", help="For service apply, delete live services missing from desired files.")
+    apply.add_argument(
+        "--production",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="For service prune, choose production or test services. Defaults to productions present in desired files.",
+    )
     apply.add_argument("--confirm", action="store_true", help="Apply the change. Omit for dry-run.")
     apply.add_argument("--diff", action="store_true", help="Only print diff between Zadig and the file.")
     apply.add_argument(
