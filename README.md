@@ -6,7 +6,11 @@ Basic MCP server for Zadig OpenAPI.
 
 - `zadig_workflow_list`: list/search project workflows.
 - `zadig_workflow_get`: get one custom workflow detail.
+- `zadig_workflow_create`: create one custom workflow. Defaults to dry run and requires `confirm=true`.
 - `zadig_workflow_update`: update one custom workflow. Defaults to dry run and requires `confirm=true`.
+- `zadig_workflow_delete`: delete one custom workflow. Defaults to dry run and requires `confirm=true`.
+- `zadig_workflow_diff`: diff current workflow detail against a desired workflow payload.
+- `zadig_workflow_apply`: create or update one workflow. Defaults to dry run and requires `confirm=true`.
 - `zadig_project_snapshot`: create a redacted project snapshot for audit/GitOps preparation.
 - `zadig_workflow_task_list`: list workflow tasks with deployment summaries.
 - `zadig_workflow_task_detail`: get one workflow task detail with deployment summaries.
@@ -59,8 +63,8 @@ uv run zadig-mcp
 
 ## GitOps preparation
 
-`zadig-gitops snapshot` exports a redacted project snapshot into a stable file
-tree that is suitable for Git review and later PR-based change loops.
+`zadig-gitops snapshot` exports a redacted project snapshot into a stable YAML
+file tree that is suitable for Git review and later PR-based change loops.
 
 ```bash
 ZADIG_BASE_URL="https://zadigx.shub.us" \
@@ -75,17 +79,17 @@ The output layout is:
 ```text
 zadig-config/
   projects/<project>/
-    metadata.json
-    errors.json
-    workflows/index.json
-    workflows/details/<workflow>.json
-    webhooks/<workflow>.json
-    builds/index.json
-    build-templates/index.json
-    build-templates/<template>.<id>.json
-    build-template-references/index.json
-    services/index.json
-    environments/index.json
+    metadata.yaml
+    errors.yaml
+    workflows/index.yaml
+    workflows/details/<workflow>.yaml
+    webhooks/<workflow>.yaml
+    builds/index.yaml
+    build-templates/index.yaml
+    build-templates/<template>.<id>.yaml
+    build-template-references/index.yaml
+    services/index.yaml
+    environments/index.yaml
 ```
 
 For a smaller export:
@@ -102,3 +106,36 @@ uv run zadig-gitops snapshot \
 
 Snapshot output is redacted by default. Credential-like fields and variables
 marked with `is_credential=true` are written as `***redacted***`.
+
+Apply a workflow from YAML. This is a dry-run unless `--confirm` is set.
+
+```bash
+uv run zadig-gitops apply \
+  --project fat \
+  --workflow my-new-workflow \
+  --file ./zadig-config/projects/fat/workflows/details/my-new-workflow.yaml
+```
+
+Print only the diff:
+
+```bash
+uv run zadig-gitops apply \
+  --project fat \
+  --workflow my-new-workflow \
+  --file ./zadig-config/projects/fat/workflows/details/my-new-workflow.yaml \
+  --diff
+```
+
+Actually create or update the workflow:
+
+```bash
+uv run zadig-gitops apply \
+  --project fat \
+  --workflow my-new-workflow \
+  --file ./zadig-config/projects/fat/workflows/details/my-new-workflow.yaml \
+  --confirm
+```
+
+Real apply rejects files that still contain `***redacted***` placeholders by
+default. Replace the placeholder values before applying, or pass
+`--allow-redacted` only when the target fields are intentionally redacted-safe.

@@ -4,7 +4,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .client import ZadigClient, default_project, environment_prefix, path_name, service_prefix
+from .client import ZadigAPIError, ZadigClient, default_project, environment_prefix, path_name, service_prefix
 from .service_ops import replace_container_image, summarize_services, unified_diff, upsert_variable
 
 mcp = FastMCP("zadig")
@@ -448,6 +448,65 @@ def error_summary(exc: Exception) -> dict[str, str]:
     return {"type": type(exc).__name__, "message": str(exc)}
 
 
+def prepare_workflow_payload(
+    workflow_name: str,
+    project: str,
+    workflow: dict[str, Any],
+) -> dict[str, Any]:
+    payload = dict(workflow)
+    payload.setdefault("name", workflow_name)
+    payload.setdefault("workflow_name", workflow_name)
+    payload.setdefault("workflow_key", workflow_name)
+    payload.setdefault("display_name", workflow_name)
+    payload.setdefault("project", project)
+    payload.setdefault("project_key", project)
+    return payload
+
+
+def redacted_placeholder_paths(value: Any, path: str = "$") -> list[str]:
+    if value == "***redacted***":
+        return [path]
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, item in value.items():
+            paths.extend(redacted_placeholder_paths(item, f"{path}.{key}"))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(redacted_placeholder_paths(item, f"{path}[{index}]"))
+        return paths
+    return []
+
+
+def assert_no_redacted_placeholders(value: Any, allow_redacted: bool = False) -> None:
+    if allow_redacted:
+        return
+    paths = redacted_placeholder_paths(value)
+    if paths:
+        preview = ", ".join(paths[:10])
+        suffix = "" if len(paths) <= 10 else f", ... ({len(paths)} total)"
+        raise ValueError(
+            "payload contains redacted placeholders and cannot be applied safely; "
+            f"replace/remove them or set allow_redacted=true. paths: {preview}{suffix}"
+        )
+
+
+async def workflow_exists(project: str, workflow_name: str) -> bool:
+    try:
+        await client().request(
+            "GET",
+            f"/openapi/workflows/custom/{path_name(workflow_name)}/detail",
+            project_key=project,
+        )
+        return True
+    except ZadigAPIError as exc:
+        if "HTTP 404" in str(exc):
+            return False
+        raise
+        return False
+
+
 @mcp.tool()
 async def zadig_workflow_list(
     query: str = "",
@@ -496,12 +555,11 @@ async def zadig_workflow_update(
     project_key: str | None = None,
     dry_run: bool = True,
     confirm: bool = False,
+    allow_redacted: bool = False,
 ) -> dict[str, Any]:
     """Update a custom workflow. Defaults to dry_run=true and requires confirm=true to mutate."""
     project = default_project(project_key)
-    payload = dict(workflow)
-    payload.setdefault("project", project)
-    payload.setdefault("name", workflow_name)
+    payload = prepare_workflow_payload(workflow_name, project, workflow)
 
     if dry_run or not confirm:
         return {
@@ -510,9 +568,11 @@ async def zadig_workflow_update(
             "reason": "set dry_run=false and confirm=true to update Zadig workflow",
             "project_key": project,
             "workflow_name": workflow_name,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
             "payload": redact_sensitive(payload),
         }
 
+    assert_no_redacted_placeholders(payload, allow_redacted)
     result = await client().request(
         "PUT",
         f"/api/aslan/workflow/v4/{path_name(workflow_name)}",
@@ -520,6 +580,176 @@ async def zadig_workflow_update(
         json_body=payload,
     )
     return {"applied": True, "project_key": project, "workflow_name": workflow_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_workflow_create(
+    workflow_name: str,
+    workflow: dict[str, Any],
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create a custom workflow. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = prepare_workflow_payload(workflow_name, project, workflow)
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to create Zadig workflow",
+            "project_key": project,
+            "workflow_name": workflow_name,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request(
+        "POST",
+        "/api/aslan/workflow/v4",
+        params={"projectName": project},
+        json_body=payload,
+    )
+    return {"applied": True, "project_key": project, "workflow_name": workflow_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_workflow_delete(
+    workflow_name: str,
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete a custom workflow. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = {"workflowKey": workflow_name, "projectKey": project}
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to delete Zadig workflow",
+            "project_key": project,
+            "workflow_name": workflow_name,
+            "payload": payload,
+        }
+
+    result = await client().request(
+        "DELETE",
+        "/openapi/workflows/custom",
+        params={"workflowKey": workflow_name},
+        project_key=project,
+    )
+    return {"applied": True, "project_key": project, "workflow_name": workflow_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_workflow_diff(
+    workflow_name: str,
+    workflow: dict[str, Any],
+    project_key: str | None = None,
+) -> dict[str, Any]:
+    """Diff current Zadig workflow detail against a desired workflow payload."""
+    project = default_project(project_key)
+    desired = prepare_workflow_payload(workflow_name, project, workflow)
+    exists = await workflow_exists(project, workflow_name)
+    if not exists:
+        return {
+            "project_key": project,
+            "workflow_name": workflow_name,
+            "exists": False,
+            "diff": unified_diff("", json_for_diff(desired), f"{workflow_name}:current", f"{workflow_name}:desired"),
+            "desired": redact_sensitive(desired),
+        }
+
+    current = await client().request(
+        "GET",
+        f"/openapi/workflows/custom/{path_name(workflow_name)}/detail",
+        project_key=project,
+    )
+    diff = unified_diff(
+        json_for_diff(current),
+        json_for_diff(desired),
+        f"{workflow_name}:current",
+        f"{workflow_name}:desired",
+    )
+    return {
+        "project_key": project,
+        "workflow_name": workflow_name,
+        "exists": True,
+        "changed": bool(diff.strip()),
+        "diff": diff,
+    }
+
+
+@mcp.tool()
+async def zadig_workflow_apply(
+    workflow_name: str,
+    workflow: dict[str, Any],
+    project_key: str | None = None,
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create or update a custom workflow. mode can be auto, create, or update. Defaults to dry_run=true."""
+    project = default_project(project_key)
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+
+    exists = await workflow_exists(project, workflow_name)
+    action = mode
+    if action == "auto":
+        action = "update" if exists else "create"
+    if action == "create" and exists:
+        raise ValueError(f"workflow {workflow_name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"workflow {workflow_name!r} does not exist; use mode='create' or mode='auto'")
+
+    diff_result = await zadig_workflow_diff(workflow_name, workflow, project)
+    payload = prepare_workflow_payload(workflow_name, project, workflow)
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to apply Zadig workflow",
+            "project_key": project,
+            "workflow_name": workflow_name,
+            "exists": exists,
+            "action": action,
+            "diff": diff_result.get("diff", ""),
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    if action == "create":
+        result = await client().request(
+            "POST",
+            "/api/aslan/workflow/v4",
+            params={"projectName": project},
+            json_body=payload,
+        )
+    else:
+        result = await client().request(
+            "PUT",
+            f"/api/aslan/workflow/v4/{path_name(workflow_name)}",
+            params={"projectName": project},
+            json_body=payload,
+        )
+    return {
+        "applied": True,
+        "project_key": project,
+        "workflow_name": workflow_name,
+        "exists_before_apply": exists,
+        "action": action,
+        "diff": diff_result.get("diff", ""),
+        "result": result,
+    }
 
 
 @mcp.tool()
