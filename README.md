@@ -79,14 +79,19 @@ The output layout is:
 ```text
 zadig-config/
   projects/<project>/
-    metadata.yaml
-    errors.yaml
+    _snapshot/
+      metadata.yaml
+      errors.yaml
+    iterations/index.yaml
     workflows/index.yaml
     workflows/details/<workflow>.yaml
     webhooks/<workflow>.yaml
     builds/index.yaml
+    tests/index.yaml
+    code-scans/index.yaml
     services/index.yaml
     environments/index.yaml
+    releases/index.yaml
   templates/
     build-templates/
       index.yaml
@@ -105,6 +110,10 @@ Project snapshots only include build templates that are actually referenced by
 that project, and those templates are written under `templates/` because Zadig
 template-library resources are shared resources rather than project-owned
 resources.
+
+`_snapshot/errors.yaml` is not Zadig configuration. It records snapshot-time API
+failures or unsupported sections so GitOps reviewers can tell whether an export
+is complete.
 
 For a smaller export:
 

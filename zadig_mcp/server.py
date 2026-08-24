@@ -80,6 +80,7 @@ SENSITIVE_FIELD_NAMES = {
 
 
 DEFAULT_SNAPSHOT_SECTIONS = [
+    "iterations",
     "workflows",
     "workflow_details",
     "webhooks",
@@ -88,6 +89,9 @@ DEFAULT_SNAPSHOT_SECTIONS = [
     "build_template_references",
     "services",
     "environments",
+    "tests",
+    "code_scans",
+    "releases",
 ]
 
 KNOWN_SNAPSHOT_SECTIONS = set(DEFAULT_SNAPSHOT_SECTIONS)
@@ -446,6 +450,31 @@ def normalize_snapshot_sections(sections: list[str] | None) -> list[str]:
 
 def error_summary(exc: Exception) -> dict[str, str]:
     return {"type": type(exc).__name__, "message": str(exc)}
+
+
+def payload_items(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("items", "list", "data", "tests", "scans", "codescans", "releases"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = payload_items(value)
+                if nested:
+                    return nested
+    return []
+
+
+def unsupported_project_section(name: str, reason: str) -> dict[str, Any]:
+    return {
+        "count": 0,
+        "items": [],
+        "snapshot_status": "unsupported",
+        "section": name,
+        "reason": reason,
+    }
 
 
 def prepare_workflow_payload(
@@ -866,6 +895,38 @@ async def zadig_project_snapshot(
         except Exception as exc:
             snapshot["errors"].append({"section": "builds", **error_summary(exc)})
 
+    if "tests" in selected_sections:
+        try:
+            test_payload = await client().request(
+                "GET",
+                "/api/aslan/testing/testdetail",
+                params={"projectName": project},
+            )
+            test_items = payload_items(test_payload)
+            snapshot["tests"] = {
+                "count": len(test_items),
+                "items": redact_sensitive(test_items),
+                "raw": redact_sensitive(test_payload),
+            }
+        except Exception as exc:
+            snapshot["errors"].append({"section": "tests", **error_summary(exc)})
+
+    if "code_scans" in selected_sections:
+        try:
+            scan_payload = await client().request(
+                "GET",
+                "/api/aslan/testing/scanning",
+                params={"projectName": project},
+            )
+            scan_items = payload_items(scan_payload)
+            snapshot["code_scans"] = {
+                "count": len(scan_items),
+                "items": redact_sensitive(scan_items),
+                "raw": redact_sensitive(scan_payload),
+            }
+        except Exception as exc:
+            snapshot["errors"].append({"section": "code_scans", **error_summary(exc)})
+
     template_items: list[dict[str, Any]] = []
     if any(section in selected_sections for section in ("build_templates", "build_template_references")):
         try:
@@ -968,6 +1029,18 @@ async def zadig_project_snapshot(
             snapshot["environments"] = redact_sensitive(env_payload)
         except Exception as exc:
             snapshot["errors"].append({"section": "environments", **error_summary(exc)})
+
+    if "iterations" in selected_sections:
+        snapshot["iterations"] = unsupported_project_section(
+            "iterations",
+            "Zadig iteration-management API is not mapped yet; keep this section visible for project layout completeness.",
+        )
+
+    if "releases" in selected_sections:
+        snapshot["releases"] = unsupported_project_section(
+            "releases",
+            "Zadig release/version-management API is not mapped yet; keep this section visible for project layout completeness.",
+        )
 
     snapshot["metadata"]["error_count"] = len(snapshot["errors"])
     return snapshot

@@ -80,8 +80,12 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     project_dir = output_dir / "projects" / safe_name(str(project))
     shared_template_dir = output_dir / "templates" / "build-templates"
     shared_template_reference_dir = output_dir / "references" / "build-templates"
-    write_data(project_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
-    write_data(project_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
+    snapshot_dir = project_dir / "_snapshot"
+    write_data(snapshot_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
+    write_data(snapshot_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
+
+    if "iterations" in snapshot:
+        write_data(project_dir / "iterations" / data_filename("index", output_format), snapshot["iterations"], output_format)
 
     if "workflows" in snapshot:
         write_data(project_dir / "workflows" / data_filename("index", output_format), snapshot["workflows"], output_format)
@@ -102,6 +106,12 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
 
     if "builds" in snapshot:
         write_data(project_dir / "builds" / data_filename("index", output_format), snapshot["builds"], output_format)
+
+    if "tests" in snapshot:
+        write_data(project_dir / "tests" / data_filename("index", output_format), snapshot["tests"], output_format)
+
+    if "code_scans" in snapshot:
+        write_data(project_dir / "code-scans" / data_filename("index", output_format), snapshot["code_scans"], output_format)
 
     build_templates = snapshot.get("build_templates", {})
     if build_templates:
@@ -140,6 +150,9 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
             snapshot["environments"],
             output_format,
         )
+
+    if "releases" in snapshot:
+        write_data(project_dir / "releases" / data_filename("index", output_format), snapshot["releases"], output_format)
 
 
 async def run_snapshot(args: argparse.Namespace) -> None:
