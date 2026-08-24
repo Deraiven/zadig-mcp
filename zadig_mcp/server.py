@@ -871,41 +871,11 @@ async def zadig_project_snapshot(
         try:
             template_payload = await client().request("GET", "/api/aslan/template/build")
             template_items = build_template_items_from_payload(template_payload)
-            if "build_templates" in selected_sections:
-                template_details: dict[str, Any] = {}
-                for item in template_items:
-                    template_id = first_present(item, "id", "_id")
-                    template_name = first_present(item, "name", "template_name", "templateName")
-                    if not template_id:
-                        continue
-                    try:
-                        detail_payload = await client().request(
-                            "GET",
-                            f"/api/aslan/template/build/{path_name(str(template_id))}",
-                        )
-                        template_details[str(template_id)] = {
-                            "name": template_name,
-                            "detail": redact_sensitive(detail_payload),
-                        }
-                    except Exception as exc:
-                        snapshot["errors"].append(
-                            {
-                                "section": "build_templates",
-                                "template_id": str(template_id),
-                                "template_name": str(template_name or ""),
-                                **error_summary(exc),
-                            }
-                        )
-                snapshot["build_templates"] = {
-                    "count": len(template_details),
-                    "summary": [summarize_build_template(item) for item in template_items],
-                    "items": template_details,
-                }
         except Exception as exc:
             snapshot["errors"].append({"section": "build_templates", **error_summary(exc)})
 
-    if "build_template_references" in selected_sections and template_items:
-        references: dict[str, Any] = {}
+    project_template_refs: dict[str, Any] = {}
+    if any(section in selected_sections for section in ("build_templates", "build_template_references")) and template_items:
         for item in template_items:
             template_id = first_present(item, "id", "_id")
             template_name = first_present(item, "name", "template_name", "templateName")
@@ -916,9 +886,12 @@ async def zadig_project_snapshot(
                     "GET",
                     f"/api/aslan/template/build/{path_name(str(template_id))}/reference",
                 )
-                references[str(template_id)] = {
+                project_references = filter_references_for_project(reference_payload, project)
+                if not project_references:
+                    continue
+                project_template_refs[str(template_id)] = {
                     "name": template_name,
-                    "references": redact_sensitive(reference_payload),
+                    "references": redact_sensitive(project_references),
                 }
             except Exception as exc:
                 snapshot["errors"].append(
@@ -929,9 +902,53 @@ async def zadig_project_snapshot(
                         **error_summary(exc),
                     }
                 )
+
+    if "build_templates" in selected_sections and template_items:
+        template_details: dict[str, Any] = {}
+        template_items_by_id = {
+            str(first_present(item, "id", "_id")): item for item in template_items if first_present(item, "id", "_id")
+        }
+        for template_id in project_template_refs:
+            item = template_items_by_id.get(template_id, {})
+            template_name = first_present(item, "name", "template_name", "templateName") or project_template_refs[
+                template_id
+            ].get("name")
+            try:
+                detail_payload = await client().request(
+                    "GET",
+                    f"/api/aslan/template/build/{path_name(str(template_id))}",
+                )
+                template_details[template_id] = {
+                    "name": template_name,
+                    "detail": redact_sensitive(detail_payload),
+                }
+            except Exception as exc:
+                snapshot["errors"].append(
+                    {
+                        "section": "build_templates",
+                        "template_id": str(template_id),
+                        "template_name": str(template_name or ""),
+                        **error_summary(exc),
+                    }
+                )
+        snapshot["build_templates"] = {
+            "count": len(template_details),
+            "scope": "project_referenced",
+            "project_key": project,
+            "summary": [
+                summarize_build_template(template_items_by_id[template_id])
+                for template_id in project_template_refs
+                if template_id in template_items_by_id
+            ],
+            "items": template_details,
+        }
+
+    if "build_template_references" in selected_sections and template_items:
         snapshot["build_template_references"] = {
-            "count": len(references),
-            "items": references,
+            "count": len(project_template_refs),
+            "scope": "project_referenced",
+            "project_key": project,
+            "items": project_template_refs,
         }
 
     if "services" in selected_sections:
@@ -1201,6 +1218,27 @@ def build_template_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     return []
+
+
+def reference_mentions_project(value: Any, project: str) -> bool:
+    if isinstance(value, dict):
+        for key in ("project_name", "projectName", "project_key", "projectKey"):
+            if value.get(key) == project:
+                return True
+        return any(reference_mentions_project(item, project) for item in value.values())
+    if isinstance(value, list):
+        return any(reference_mentions_project(item, project) for item in value)
+    return False
+
+
+def filter_references_for_project(value: Any, project: str) -> Any:
+    if isinstance(value, list):
+        return [item for item in value if reference_mentions_project(item, project)]
+    if isinstance(value, dict):
+        if reference_mentions_project(value, project):
+            return value
+        return {}
+    return [] if not reference_mentions_project(value, project) else value
 
 
 def summarize_build_template(item: dict[str, Any]) -> dict[str, Any]:

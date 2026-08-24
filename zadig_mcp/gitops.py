@@ -78,6 +78,8 @@ def workflow_payload_from_file(path: Path) -> dict[str, Any]:
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
+    shared_template_dir = output_dir / "build-templates"
+    shared_template_reference_dir = output_dir / "build-template-references"
     write_data(project_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
     write_data(project_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
 
@@ -104,9 +106,11 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     build_templates = snapshot.get("build_templates", {})
     if build_templates:
         write_data(
-            project_dir / "build-templates" / data_filename("index", output_format),
+            shared_template_dir / data_filename("index", output_format),
             {
                 "count": build_templates.get("count", 0),
+                "scope": build_templates.get("scope"),
+                "project_key": build_templates.get("project_key"),
                 "summary": build_templates.get("summary", []),
             },
             output_format,
@@ -114,9 +118,7 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     for template_id, item in build_templates.get("items", {}).items():
         template_name = item.get("name") or template_id
         write_data(
-            project_dir
-            / "build-templates"
-            / data_filename(f"{safe_name(str(template_name))}.{safe_name(str(template_id))}", output_format),
+            shared_template_dir / data_filename(f"{safe_name(str(template_name))}.{safe_name(str(template_id))}", output_format),
             item,
             output_format,
         )
@@ -124,7 +126,7 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     template_refs = snapshot.get("build_template_references", {})
     if template_refs:
         write_data(
-            project_dir / "build-template-references" / data_filename("index", output_format),
+            shared_template_reference_dir / data_filename("index", output_format),
             template_refs,
             output_format,
         )
