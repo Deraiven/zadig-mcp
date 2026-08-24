@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import copy
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -126,6 +128,60 @@ def build_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
     spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
     if not spec:
         raise ValueError("build document must contain spec")
+    return spec
+
+
+def normalize_script(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def config_root_for(path: Path) -> Path:
+    for parent in [path if path.is_dir() else path.parent, *path.parents]:
+        if (parent / "projects").is_dir():
+            return parent
+    return Path.cwd()
+
+
+def build_script_ref_path(project: str, script_name: str) -> str:
+    return f"projects/{safe_name(project)}/builds/scripts/{script_name}"
+
+
+def expand_build_script_ref(document: dict[str, Any], document_path: Path) -> dict[str, Any]:
+    spec = copy.deepcopy(build_spec_from_document(document))
+    script_ref = spec.pop("build_script_ref", None)
+    if not isinstance(script_ref, dict):
+        return spec
+
+    ref_path = script_ref.get("path")
+    if not ref_path:
+        raise ValueError(f"{document_path} spec.build_script_ref requires path")
+    ref = Path(str(ref_path))
+    if ref.is_absolute():
+        raise ValueError(f"{document_path} spec.build_script_ref.path must be relative")
+
+    root = config_root_for(document_path)
+    script_path = (root / ref).resolve()
+    if not script_path.is_file():
+        fallback = (document_path.parent / ref).resolve()
+        if fallback.is_file():
+            script_path = fallback
+        else:
+            raise ValueError(f"{document_path} references missing build script {ref_path}")
+
+    script = normalize_script(script_path.read_text(encoding="utf-8"))
+    checksum = script_ref.get("checksum")
+    if checksum:
+        expected = str(checksum).replace("sha256:", "")
+        actual = sha256_text(script)
+        if expected != actual:
+            raise ValueError(
+                f"{document_path} build script checksum mismatch for {ref_path}: expected sha256:{expected}, got sha256:{actual}"
+            )
+    spec["build_script"] = script
     return spec
 
 
@@ -358,6 +414,90 @@ async def delete_service(project: str, service_name: str, production: bool, *, d
     return result
 
 
+def extract_project_build_scripts(
+    project: str,
+    build_details: dict[str, Any],
+    project_dir: Path,
+    output_format: str,
+) -> dict[str, Any]:
+    script_groups: dict[str, dict[str, Any]] = {}
+    for build_name, document in build_details.items():
+        if not isinstance(document, dict):
+            continue
+        spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+        script = spec.get("build_script")
+        if not isinstance(script, str) or not script:
+            continue
+        normalized = normalize_script(script)
+        checksum = sha256_text(normalized)
+        script_groups.setdefault(checksum, {"script": normalized, "builds": []})
+        script_groups[checksum]["builds"].append(str(build_name))
+
+    if not script_groups:
+        return {}
+
+    refs_by_build: dict[str, dict[str, str]] = {}
+    scripts_index: list[dict[str, Any]] = []
+    for checksum, group in sorted(script_groups.items(), key=lambda item: sorted(item[1]["builds"])[0]):
+        builds = sorted(group["builds"])
+        if len(builds) == 1:
+            script_name = f"{safe_name(builds[0])}.sh"
+        else:
+            script_name = f"shared-{checksum[:12]}.sh"
+        ref_path = build_script_ref_path(project, script_name)
+        script_file = project_dir / "builds" / "scripts" / script_name
+        script_file.parent.mkdir(parents=True, exist_ok=True)
+        script_file.write_text(group["script"], encoding="utf-8")
+
+        meta = {
+            "name": script_name.removesuffix(".sh"),
+            "project": project,
+            "checksum": f"sha256:{checksum}",
+            "used_by": builds,
+            "change_policy": {
+                "impact_note_required": len(builds) > 1,
+            },
+        }
+        write_data(
+            project_dir / "builds" / "scripts" / data_filename(script_name.removesuffix(".sh") + ".meta", output_format),
+            meta,
+            output_format,
+        )
+        scripts_index.append({"path": ref_path, **meta})
+        for build_name in builds:
+            refs_by_build[build_name] = {
+                "path": ref_path,
+                "checksum": f"sha256:{checksum}",
+            }
+
+    write_data(
+        project_dir / "builds" / "scripts" / data_filename("index", output_format),
+        {
+            "count": len(scripts_index),
+            "items": scripts_index,
+        },
+        output_format,
+    )
+
+    for build_name, document in build_details.items():
+        script_ref = refs_by_build.get(str(build_name))
+        if not script_ref or not isinstance(document, dict):
+            continue
+        spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+        spec.pop("build_script", None)
+        spec["build_script_ref"] = script_ref
+
+        live = document.get("live") if isinstance(document.get("live"), dict) else {}
+        detail = live.get("detail") if isinstance(live.get("detail"), dict) else {}
+        detail.pop("build_script", None)
+        detail["build_script_ref"] = script_ref
+
+    return {
+        "count": len(scripts_index),
+        "items": scripts_index,
+    }
+
+
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
@@ -392,13 +532,17 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
 
     if "builds" in snapshot:
         builds = snapshot["builds"] if isinstance(snapshot["builds"], dict) else {}
+        build_details = builds.get("details") if isinstance(builds.get("details"), dict) else {}
+        build_scripts = extract_project_build_scripts(project, build_details, project_dir, output_format)
         build_index = {
             key: value
             for key, value in builds.items()
             if key not in {"details"}
         }
+        if build_scripts:
+            build_index["scripts"] = build_scripts
         write_data(project_dir / "builds" / data_filename("index", output_format), build_index, output_format)
-        for build_name, detail in (builds.get("details") or {}).items():
+        for build_name, detail in build_details.items():
             write_data(
                 project_dir / "builds" / "items" / data_filename(safe_name(str(build_name)), output_format),
                 detail,
@@ -608,10 +752,11 @@ async def run_apply_build(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
             continue
+        build_spec = expand_build_script_ref(document, build_file)
         results.append(
             await zadig_build_apply(
                 build_name=build_name,
-                build=build_spec_from_document(document),
+                build=build_spec,
                 project_key=project,
                 mode=args.mode,
                 dry_run=not args.confirm,

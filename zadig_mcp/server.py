@@ -1,3 +1,4 @@
+import copy
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -1671,10 +1672,11 @@ def prepare_build_payload(build_name: str, project: str, build: dict[str, Any]) 
 
 def build_desired_payload(build_name: str, project: str, build: dict[str, Any]) -> dict[str, Any]:
     payload = {
-        key: value
+        key: copy.deepcopy(value)
         for key, value in build.items()
         if key not in {"update_by", "updateBy", "update_time", "updateTime"}
     }
+    payload.pop("build_script_ref", None)
     payload.setdefault("name", build_name)
     payload.setdefault("project_key", project)
     return payload

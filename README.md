@@ -95,6 +95,8 @@ zadig-config/
     webhooks/<workflow>.yaml
     builds/index.yaml
     builds/items/<build>.yaml
+    builds/scripts/<script>.sh
+    builds/scripts/<script>.meta.yaml
     tests/index.yaml
     code-scans/index.yaml
     services/index.yaml
@@ -130,6 +132,12 @@ section that later service CRUD apply commands can use.
 
 `builds/index.yaml` is also an inventory only. Per-build files under
 `builds/items/` hold the live build detail and a GitOps-oriented `spec`.
+When a build has a `build_script`, snapshot writes the script under
+`projects/<project>/builds/scripts/` and replaces the inline script with
+`spec.build_script_ref`. Multiple builds with identical scripts share one
+script file and the matching `.meta.yaml` lists the `used_by` impact set. Build
+apply expands the script ref back into the Zadig `build_script` payload after
+checking the optional SHA-256 checksum.
 
 `project.yaml` is the top-level project document exported from live Zadig
 project metadata. It is currently read-only snapshot data plus a small
