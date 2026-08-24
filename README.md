@@ -2,6 +2,12 @@
 
 Basic MCP server for Zadig OpenAPI.
 
+## Version target
+
+This tool targets StoreHub's Zadig 4.3 deployment. API behavior should be
+checked against the live `zadigx.shub.us` instance and Zadig
+`release-4.3.0` source when public documentation is incomplete.
+
 ## Tools
 
 - `zadig_workflow_list`: list/search project workflows.
