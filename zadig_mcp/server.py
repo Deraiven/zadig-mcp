@@ -1164,9 +1164,27 @@ async def zadig_project_snapshot(
                 params={"pageNum": 1, "pageSize": 200},
             )
             build_items = build_items_from_payload(build_payload)
+            build_summaries = [summarize_build(item) for item in build_items]
+            build_details: dict[str, Any] = {}
+            build_items_by_name = {
+                str(item["name"]): item for item in build_summaries if item.get("name")
+            }
+            for build_name, index_item in build_items_by_name.items():
+                try:
+                    detail_payload = await client().request(
+                        "GET",
+                        f"/openapi/build/{path_name(build_name)}/detail",
+                        project_key=project,
+                    )
+                    detail = redact_sensitive(detail_payload)
+                    build_details[build_name] = build_gitops_document(project, build_name, index_item, detail)
+                except Exception as exc:
+                    snapshot["errors"].append({"section": "build_details", "build_name": build_name, **error_summary(exc)})
+                    build_details[build_name] = build_gitops_document(project, build_name, index_item, None)
             snapshot["builds"] = {
                 "count": len(build_items),
-                "items": [summarize_build(item) for item in build_items],
+                "items": build_summaries,
+                "details": build_details,
                 "raw": redact_sensitive(build_payload),
             }
         except Exception as exc:
@@ -1618,6 +1636,64 @@ def summarize_build(item: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in summary.items() if value not in (None, "", [], {})}
 
 
+def build_gitops_document(
+    project: str,
+    build_name: str,
+    list_item: dict[str, Any] | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    list_item = list_item or {}
+    detail = detail or {}
+    spec = build_desired_payload(build_name, project, detail)
+    spec.setdefault("name", build_name)
+    spec.setdefault("project_key", project)
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "Build",
+        "metadata": {
+            "project": project,
+            "name": build_name,
+        },
+        "spec": spec,
+        "live": {
+            "list": list_item,
+            "detail": detail,
+        },
+    }
+
+
+def prepare_build_payload(build_name: str, project: str, build: dict[str, Any]) -> dict[str, Any]:
+    payload = build_desired_payload(build_name, project, build)
+    payload.setdefault("name", build_name)
+    payload.setdefault("project_key", project)
+    return payload
+
+
+def build_desired_payload(build_name: str, project: str, build: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        key: value
+        for key, value in build.items()
+        if key not in {"update_by", "updateBy", "update_time", "updateTime"}
+    }
+    payload.setdefault("name", build_name)
+    payload.setdefault("project_key", project)
+    return payload
+
+
+async def build_exists(project: str, build_name: str) -> bool:
+    try:
+        await client().request(
+            "GET",
+            f"/openapi/build/{path_name(build_name)}/detail",
+            project_key=project,
+        )
+        return True
+    except ZadigAPIError as exc:
+        if "HTTP 404" in str(exc) or "no documents in result" in str(exc):
+            return False
+        raise
+
+
 def build_template_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         for key in ("build_templates", "buildTemplates", "templates", "items", "list", "data"):
@@ -1842,18 +1918,47 @@ async def zadig_build_get(
 
 
 @mcp.tool()
+async def zadig_build_create(
+    build_name: str,
+    build: dict[str, Any],
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create one Zadig build. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = prepare_build_payload(build_name, project, build)
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to create Zadig build",
+            "project_key": project,
+            "build_name": build_name,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    params = {"source": "template"} if payload.get("source") == "template" else None
+    result = await client().request("POST", "/openapi/build", project_key=project, params=params, json_body=payload)
+    return {"applied": True, "project_key": project, "build_name": build_name, "result": result}
+
+
+@mcp.tool()
 async def zadig_build_update(
     build_name: str,
     build: dict[str, Any],
     project_key: str | None = None,
     dry_run: bool = True,
     confirm: bool = False,
+    allow_redacted: bool = False,
 ) -> dict[str, Any]:
     """Update one Zadig build configuration. Defaults to dry_run=true and requires confirm=true."""
     project = default_project(project_key)
-    payload = dict(build)
-    payload.setdefault("name", build_name)
-    payload.setdefault("project_key", project)
+    payload = prepare_build_payload(build_name, project, build)
 
     if dry_run or not confirm:
         return {
@@ -1862,9 +1967,11 @@ async def zadig_build_update(
             "reason": "set dry_run=false and confirm=true to update Zadig build",
             "project_key": project,
             "build_name": build_name,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
             "payload": redact_sensitive(payload),
         }
 
+    assert_no_redacted_placeholders(payload, allow_redacted)
     result = await client().request(
         "PUT",
         "/openapi/build",
@@ -1872,6 +1979,134 @@ async def zadig_build_update(
         json_body=payload,
     )
     return {"applied": True, "project_key": project, "build_name": build_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_build_delete(
+    build_name: str,
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete one Zadig build. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = {"name": build_name, "projectKey": project}
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to delete Zadig build",
+            "project_key": project,
+            "build_name": build_name,
+            "payload": payload,
+        }
+
+    result = await client().request("DELETE", "/openapi/build", params={"name": build_name}, project_key=project)
+    return {"applied": True, "project_key": project, "build_name": build_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_build_diff(
+    build_name: str,
+    build: dict[str, Any],
+    project_key: str | None = None,
+) -> dict[str, Any]:
+    """Diff current Zadig build detail against desired build payload."""
+    project = default_project(project_key)
+    desired = prepare_build_payload(build_name, project, build)
+    exists = await build_exists(project, build_name)
+    if not exists:
+        return {
+            "project_key": project,
+            "build_name": build_name,
+            "exists": False,
+            "diff": unified_diff("", json_for_diff(desired), f"{build_name}:current", f"{build_name}:desired"),
+            "desired": redact_sensitive(desired),
+        }
+
+    current = await client().request(
+        "GET",
+        f"/openapi/build/{path_name(build_name)}/detail",
+        project_key=project,
+    )
+    current_desired = build_desired_payload(build_name, project, current if isinstance(current, dict) else {})
+    diff = unified_diff(
+        json_for_diff(current_desired),
+        json_for_diff(desired),
+        f"{build_name}:current",
+        f"{build_name}:desired",
+    )
+    return {
+        "project_key": project,
+        "build_name": build_name,
+        "exists": True,
+        "changed": bool(diff.strip()),
+        "diff": diff,
+    }
+
+
+@mcp.tool()
+async def zadig_build_apply(
+    build_name: str,
+    build: dict[str, Any],
+    project_key: str | None = None,
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create or update one Zadig build. mode can be auto, create, or update. Defaults to dry_run=true."""
+    project = default_project(project_key)
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+
+    exists = await build_exists(project, build_name)
+    action = mode
+    if action == "auto":
+        action = "update" if exists else "create"
+    if action == "create" and exists:
+        raise ValueError(f"build {build_name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"build {build_name!r} does not exist; use mode='create' or mode='auto'")
+
+    diff_result = await zadig_build_diff(build_name, build, project)
+    payload = prepare_build_payload(build_name, project, build)
+    diff_text = diff_result.get("diff", "")
+    if action == "update" and not diff_text.strip():
+        action = "none"
+
+    if dry_run or not confirm or action == "none":
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "build exists and desired spec matches live state"
+            if action == "none"
+            else "set dry_run=false and confirm=true to apply Zadig build",
+            "project_key": project,
+            "build_name": build_name,
+            "exists": exists,
+            "action": action,
+            "diff": diff_text,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    if action == "create":
+        params = {"source": "template"} if payload.get("source") == "template" else None
+        result = await client().request("POST", "/openapi/build", project_key=project, params=params, json_body=payload)
+    else:
+        result = await client().request("PUT", "/openapi/build", project_key=project, json_body=payload)
+    return {
+        "applied": True,
+        "project_key": project,
+        "build_name": build_name,
+        "exists_before_apply": exists,
+        "action": action,
+        "diff": diff_text,
+        "result": result,
+    }
 
 
 @mcp.tool()

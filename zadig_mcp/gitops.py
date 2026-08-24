@@ -14,6 +14,7 @@ from .server import (
     client,
     zadig_project_snapshot,
     zadig_project_apply_plan,
+    zadig_build_apply,
     zadig_workflow_apply,
     zadig_workflow_diff,
 )
@@ -103,6 +104,31 @@ def project_document_from_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def build_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"build file {path} must contain a mapping")
+    if data.get("kind") != "Build":
+        raise ValueError(f"build file {path} must have kind: Build")
+    return data
+
+
+def build_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    name = metadata.get("name") or spec.get("name") or document.get("build_name")
+    if not name:
+        raise ValueError("build document must contain metadata.name or spec.name")
+    return str(name)
+
+
+def build_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    if not spec:
+        raise ValueError("build document must contain spec")
+    return spec
+
+
 def service_name_from_document(document: dict[str, Any]) -> str:
     metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
     name = metadata.get("name") or document.get("service_name")
@@ -163,6 +189,38 @@ def desired_service_files(path: Path) -> list[Path]:
         return [path]
     items_dir = path / "items" if (path / "items").is_dir() else path
     return sorted(item for item in items_dir.glob("*.yaml") if item.is_file())
+
+
+def desired_build_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file())
+
+
+async def live_build_names(project: str) -> set[str]:
+    payload = await client().request(
+        "GET",
+        "/openapi/build",
+        project_key=project,
+        params={"pageNum": 1, "pageSize": 500},
+    )
+    builds = payload.get("builds", []) if isinstance(payload, dict) else []
+    return {str(item.get("name")) for item in builds if isinstance(item, dict) and item.get("name")}
+
+
+async def delete_build(project: str, build_name: str, *, dry_run: bool, confirm: bool) -> dict[str, Any]:
+    result = {
+        "build_name": build_name,
+        "action": "delete",
+        "applied": False,
+        "dry_run": dry_run,
+    }
+    if dry_run or not confirm:
+        return result
+    result["result"] = await client().request("DELETE", "/openapi/build", params={"name": build_name}, project_key=project)
+    result["applied"] = True
+    return result
 
 
 async def live_service_names(project: str, production: bool) -> set[str]:
@@ -333,7 +391,19 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
         write_data(project_dir / "webhooks" / data_filename(safe_name(str(workflow_name)), output_format), detail, output_format)
 
     if "builds" in snapshot:
-        write_data(project_dir / "builds" / data_filename("index", output_format), snapshot["builds"], output_format)
+        builds = snapshot["builds"] if isinstance(snapshot["builds"], dict) else {}
+        build_index = {
+            key: value
+            for key, value in builds.items()
+            if key not in {"details"}
+        }
+        write_data(project_dir / "builds" / data_filename("index", output_format), build_index, output_format)
+        for build_name, detail in (builds.get("details") or {}).items():
+            write_data(
+                project_dir / "builds" / "items" / data_filename(safe_name(str(build_name)), output_format),
+                detail,
+                output_format,
+            )
 
     if "tests" in snapshot:
         write_data(project_dir / "tests" / data_filename("index", output_format), snapshot["tests"], output_format)
@@ -418,6 +488,11 @@ async def run_apply(args: argparse.Namespace) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
+    if args.entity == "build":
+        result = await run_apply_build(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
     if args.entity == "service":
         result = await run_apply_service(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
@@ -480,6 +555,96 @@ async def run_apply_project(args: argparse.Namespace) -> dict[str, Any]:
     result["file"] = str(project_file) if project_file else None
     result["confirm_ignored"] = bool(args.confirm)
     return result
+
+
+async def run_apply_build(args: argparse.Namespace) -> dict[str, Any]:
+    project = args.project
+    if args.mode == "delete" and args.build and not args.file and not args.dir:
+        return {
+            "project_key": project,
+            "entity": "build",
+            "dry_run": not args.confirm,
+            "confirm": args.confirm,
+            "desired_file_count": 0,
+            "results": [
+                await delete_build(
+                    project,
+                    args.build,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            ],
+            "prune_results": [],
+        }
+    if not args.file and not args.dir:
+        raise ValueError("--file or --dir is required for build apply")
+    if args.prune and not args.dir:
+        raise ValueError("--prune requires --dir so the desired build set is explicit")
+    if args.mode == "delete" and not args.build and not args.file:
+        raise ValueError("--build or --file is required for build delete mode")
+
+    files: list[Path] = []
+    if args.mode != "delete" or args.file or args.dir:
+        target_path = Path(args.file or args.dir).expanduser().resolve()
+        files = desired_build_files(target_path)
+        if not files and args.mode != "delete":
+            raise ValueError(f"no build YAML files found under {target_path}")
+
+    results = []
+    desired_names: set[str] = set()
+    for build_file in files:
+        document = build_document_from_file(build_file)
+        build_name = build_name_from_document(document)
+        desired_names.add(build_name)
+        if args.build and build_name != args.build:
+            continue
+        if args.mode == "delete":
+            results.append(
+                await delete_build(
+                    project,
+                    build_name,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+            continue
+        results.append(
+            await zadig_build_apply(
+                build_name=build_name,
+                build=build_spec_from_document(document),
+                project_key=project,
+                mode=args.mode,
+                dry_run=not args.confirm,
+                confirm=args.confirm,
+                allow_redacted=args.allow_redacted,
+            )
+        )
+
+    prune_results = []
+    if args.prune:
+        for live_name in sorted(await live_build_names(project)):
+            if args.build and live_name != args.build:
+                continue
+            if live_name in desired_names:
+                continue
+            prune_results.append(
+                await delete_build(
+                    project,
+                    live_name,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+
+    return {
+        "project_key": project,
+        "entity": "build",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "desired_file_count": len(files),
+        "results": results,
+        "prune_results": prune_results,
+    }
 
 
 async def run_apply_service(args: argparse.Namespace) -> dict[str, Any]:
@@ -571,13 +736,14 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "entity",
         nargs="?",
-        choices=["workflow", "service", "project"],
+        choices=["workflow", "service", "project", "build"],
         default="workflow",
         help="Entity type to apply or plan.",
     )
     apply.add_argument("--project", required=True, help="Zadig project key.")
     apply.add_argument("--workflow", help="Workflow name. Defaults to workflow_name/workflow_key/name from file.")
     apply.add_argument("--service", help="Service name filter for service apply.")
+    apply.add_argument("--build", help="Build name filter for build apply/delete.")
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
     apply.add_argument("--dir", help="Directory containing service item YAML files, usually projects/<project>/services.")
     apply.add_argument("--mode", choices=["auto", "create", "update", "delete"], default="auto", help="Apply mode.")

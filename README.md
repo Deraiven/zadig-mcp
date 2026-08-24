@@ -94,6 +94,7 @@ zadig-config/
     workflows/details/<workflow>.yaml
     webhooks/<workflow>.yaml
     builds/index.yaml
+    builds/items/<build>.yaml
     tests/index.yaml
     code-scans/index.yaml
     services/index.yaml
@@ -126,6 +127,9 @@ is complete.
 `services/index.yaml` is an inventory only. Per-service files under
 `services/items/` hold the live service detail and a GitOps-oriented `spec`
 section that later service CRUD apply commands can use.
+
+`builds/index.yaml` is also an inventory only. Per-build files under
+`builds/items/` hold the live build detail and a GitOps-oriented `spec`.
 
 `project.yaml` is the top-level project document exported from live Zadig
 project metadata. It is currently read-only snapshot data plus a small
@@ -209,6 +213,33 @@ uv run zadig-gitops apply service \
 Service apply currently supports creating Helm `chartTemplate` services,
 deleting missing services with `--prune`, and updating supported mutable fields
 (`spec.yaml` and `spec.template.variables`) when Zadig exposes them.
+
+Apply build desired state from per-build YAML files. This is dry-run unless
+`--confirm` is set.
+
+```bash
+uv run zadig-gitops apply build \
+  --project bi \
+  --file ./zadig-config/projects/bi/builds/items/bi-build.yaml
+```
+
+Apply all build files in a project:
+
+```bash
+uv run zadig-gitops apply build \
+  --project bi \
+  --dir ./zadig-config/projects/bi/builds
+```
+
+Delete live builds that are missing from the desired build directory:
+
+```bash
+uv run zadig-gitops apply build \
+  --project bi \
+  --dir ./zadig-config/projects/bi/builds \
+  --prune \
+  --confirm
+```
 
 Plan project changes from `project.yaml`. Project apply is intentionally
 plan-only for now: create/update/delete modes only compare desired config with
