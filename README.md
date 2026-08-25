@@ -107,6 +107,12 @@ zadig-config/
     workflows/details/<workflow>.yaml
     webhooks/<workflow>.yaml
     builds/index.yaml
+    workflows/index.yaml
+    workflows/items/<workflow>.yaml
+    workflows/scripts/<workflow>/<stage>.<job>.script.sh
+    workflows/scripts/index.yaml
+    workflows/triggers/<workflow>.yaml
+    workflows/notifications/<workflow>.yaml
     builds/items/<build>.yaml
     builds/scripts/<script>.sh
     builds/scripts/<script>.meta.yaml
@@ -169,6 +175,20 @@ checking the optional SHA-256 checksum.
 project metadata. It is currently read-only snapshot data plus a small
 GitOps-oriented `spec`.
 
+Workflow snapshots are split for reviewability:
+
+- `workflows/items/<workflow>.yaml` stores the main `kind: Workflow` desired
+  state.
+- `workflows/scripts/<workflow>/*.sh` stores long job scripts referenced by
+  `script_ref` with a SHA-256 checksum.
+- `workflows/triggers/<workflow>.yaml` stores `kind: WorkflowTriggers` under the
+  workflow namespace.
+- `workflows/notifications/<workflow>.yaml` stores `kind: WorkflowNotifications`.
+
+Workflow apply expands `script_ref` and `notifications_ref` back into the Zadig
+workflow payload. Trigger apply is intentionally separate so webhook drift can
+be reviewed without mixing it into stage/job changes.
+
 Environment snapshots are split for future CRUD support:
 
 ```text
@@ -224,7 +244,7 @@ Apply a workflow from YAML. This is a dry-run unless `--confirm` is set.
 uv run zadig-gitops apply \
   --project fat \
   --workflow my-new-workflow \
-  --file ./zadig-config/projects/fat/workflows/details/my-new-workflow.yaml
+  --file ./zadig-config/projects/fat/workflows/items/my-new-workflow.yaml
 ```
 
 Print only the diff:
@@ -233,7 +253,16 @@ Print only the diff:
 uv run zadig-gitops apply \
   --project fat \
   --workflow my-new-workflow \
-  --file ./zadig-config/projects/fat/workflows/details/my-new-workflow.yaml \
+  --file ./zadig-config/projects/fat/workflows/items/my-new-workflow.yaml \
+  --diff
+```
+
+You can omit `--file/--dir` when using the default config layout:
+
+```bash
+uv run zadig-gitops apply workflow \
+  --project fat \
+  --workflow my-new-workflow \
   --diff
 ```
 
@@ -243,7 +272,7 @@ Actually create or update the workflow:
 uv run zadig-gitops apply \
   --project fat \
   --workflow my-new-workflow \
-  --file ./zadig-config/projects/fat/workflows/details/my-new-workflow.yaml \
+  --file ./zadig-config/projects/fat/workflows/items/my-new-workflow.yaml \
   --confirm
 ```
 

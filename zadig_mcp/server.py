@@ -894,6 +894,13 @@ def prepare_workflow_payload(
     return payload
 
 
+def comparable_workflow_payload(workflow_name: str, project: str, workflow: dict[str, Any]) -> dict[str, Any]:
+    payload = prepare_workflow_payload(workflow_name, project, workflow)
+    for key in ("create_time", "update_time", "created_by", "updated_by", "hash", "id"):
+        payload.pop(key, None)
+    return payload
+
+
 def redacted_placeholder_paths(value: Any, path: str = "$") -> list[str]:
     if value == "***redacted***":
         return [path]
@@ -1113,7 +1120,7 @@ async def zadig_workflow_diff(
 ) -> dict[str, Any]:
     """Diff current Zadig workflow detail against a desired workflow payload."""
     project = default_project(project_key)
-    desired = prepare_workflow_payload(workflow_name, project, workflow)
+    desired = comparable_workflow_payload(workflow_name, project, workflow)
     exists = await workflow_exists(project, workflow_name)
     if not exists:
         return {
@@ -1129,8 +1136,9 @@ async def zadig_workflow_diff(
         f"/openapi/workflows/custom/{path_name(workflow_name)}/detail",
         project_key=project,
     )
+    current_comparable = comparable_workflow_payload(workflow_name, project, current if isinstance(current, dict) else {})
     diff = unified_diff(
-        json_for_diff(current),
+        json_for_diff(current_comparable),
         json_for_diff(desired),
         f"{workflow_name}:current",
         f"{workflow_name}:desired",

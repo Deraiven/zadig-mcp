@@ -34,6 +34,7 @@ from .server import (
     zadig_build_template_delete,
     zadig_build_template_diff,
     zadig_workflow_apply,
+    zadig_workflow_delete,
     zadig_workflow_diff,
 )
 from .service_ops import iter_services
@@ -98,10 +99,35 @@ def workflow_payload_from_file(path: Path) -> dict[str, Any]:
     data = load_data(path)
     if not isinstance(data, dict):
         raise ValueError(f"workflow file {path} must contain a mapping")
+    if data.get("kind") == "Workflow":
+        return expand_workflow_refs(data, path)
     detail = data.get("detail")
     if isinstance(detail, dict):
         return detail
     return data
+
+
+def desired_workflow_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
+def workflow_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    name = metadata.get("name") or spec.get("workflow_name") or spec.get("workflow_key") or spec.get("name")
+    if not name:
+        raise ValueError("workflow document must contain metadata.name or spec.workflow_name")
+    return str(name)
+
+
+def workflow_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    if not spec:
+        raise ValueError("workflow document must contain spec")
+    return copy.deepcopy(spec)
 
 
 def service_document_from_file(path: Path) -> dict[str, Any]:
@@ -295,6 +321,10 @@ def build_script_ref_path(project: str, script_name: str) -> str:
     return f"projects/{safe_name(project)}/builds/scripts/{script_name}"
 
 
+def workflow_script_ref_path(project: str, workflow_name: str, script_name: str) -> str:
+    return f"projects/{safe_name(project)}/workflows/scripts/{safe_name(workflow_name)}/{script_name}"
+
+
 def expand_build_script_ref(document: dict[str, Any], document_path: Path) -> dict[str, Any]:
     spec = copy.deepcopy(build_spec_from_document(document))
     script_ref = spec.pop("build_script_ref", None)
@@ -327,6 +357,68 @@ def expand_build_script_ref(document: dict[str, Any], document_path: Path) -> di
                 f"{document_path} build script checksum mismatch for {ref_path}: expected sha256:{expected}, got sha256:{actual}"
             )
     spec["build_script"] = script
+    return spec
+
+
+def read_ref_text(document_path: Path, ref_path: str, checksum: str = "") -> str:
+    ref = Path(str(ref_path))
+    if ref.is_absolute():
+        raise ValueError(f"{document_path} reference path must be relative: {ref_path}")
+
+    root = config_root_for(document_path)
+    target_path = (root / ref).resolve()
+    if not target_path.is_file():
+        fallback = (document_path.parent / ref).resolve()
+        if fallback.is_file():
+            target_path = fallback
+        else:
+            raise ValueError(f"{document_path} references missing file {ref_path}")
+
+    text = normalize_script(target_path.read_text(encoding="utf-8"))
+    if checksum:
+        expected = str(checksum).replace("sha256:", "")
+        actual = sha256_text(text)
+        if expected != actual:
+            raise ValueError(
+                f"{document_path} reference checksum mismatch for {ref_path}: "
+                f"expected sha256:{expected}, got sha256:{actual}"
+            )
+    return text
+
+
+def expand_workflow_refs(document: dict[str, Any], document_path: Path) -> dict[str, Any]:
+    spec = workflow_spec_from_document(document)
+    notifications_ref = spec.pop("notifications_ref", None)
+    spec.pop("triggers_ref", None)
+
+    if isinstance(notifications_ref, dict):
+        ref_path = notifications_ref.get("path")
+        if not ref_path:
+            raise ValueError(f"{document_path} spec.notifications_ref requires path")
+        notification_doc = load_data((config_root_for(document_path) / str(ref_path)).resolve())
+        if isinstance(notification_doc, dict):
+            notification_spec = notification_doc.get("spec") if isinstance(notification_doc.get("spec"), dict) else {}
+            if "notify_ctls" in notification_spec:
+                spec["notify_ctls"] = notification_spec["notify_ctls"]
+
+    def expand_in_mapping(mapping: dict[str, Any], location: str) -> None:
+        for key, value in list(mapping.items()):
+            if key.endswith("_ref") and isinstance(value, dict):
+                target_key = key.removesuffix("_ref")
+                ref_path = value.get("path")
+                if not ref_path:
+                    raise ValueError(f"{document_path} {location}.{key} requires path")
+                mapping[target_key] = read_ref_text(document_path, str(ref_path), str(value.get("checksum") or ""))
+                mapping.pop(key, None)
+                continue
+            if isinstance(value, dict):
+                expand_in_mapping(value, f"{location}.{key}" if location else str(key))
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        expand_in_mapping(item, f"{location}.{key}[{index}]" if location else f"{key}[{index}]")
+
+    expand_in_mapping(spec, "spec")
     return spec
 
 
@@ -837,6 +929,257 @@ def extract_build_template_scripts(
     }
 
 
+def workflow_summary(workflow_name: str, detail: dict[str, Any]) -> dict[str, Any]:
+    stages = detail.get("stages") if isinstance(detail.get("stages"), list) else []
+    params = detail.get("params") if isinstance(detail.get("params"), list) else []
+    notify_ctls = detail.get("notify_ctls") if isinstance(detail.get("notify_ctls"), list) else []
+    job_count = 0
+    for stage in stages:
+        if isinstance(stage, dict) and isinstance(stage.get("jobs"), list):
+            job_count += len(stage["jobs"])
+    return {
+        "name": workflow_name,
+        "display_name": first_present(detail, "display_name", "name", "workflow_name"),
+        "concurrency_limit": detail.get("concurrency_limit"),
+        "param_count": len(params),
+        "stage_count": len(stages),
+        "job_count": job_count,
+        "notification_count": len(notify_ctls),
+        "created_by": detail.get("created_by"),
+        "updated_by": detail.get("updated_by"),
+        "create_time": detail.get("create_time"),
+        "update_time": detail.get("update_time"),
+    }
+
+
+def workflow_gitops_document(
+    project: str,
+    workflow_name: str,
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    spec = copy.deepcopy(detail)
+    spec.pop("create_time", None)
+    spec.pop("update_time", None)
+    spec.pop("created_by", None)
+    spec.pop("updated_by", None)
+    spec.pop("hash", None)
+    spec.setdefault("project_key", project)
+    spec.setdefault("name", workflow_name)
+    spec.setdefault("workflow_name", workflow_name)
+    spec.setdefault("workflow_key", workflow_name)
+    spec.setdefault("display_name", workflow_name)
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "Workflow",
+        "metadata": {
+            "project": project,
+            "name": workflow_name,
+            "type": detail.get("type") or detail.get("workflow_type") or "custom",
+        },
+        "spec": spec,
+        "live": {
+            "summary": workflow_summary(workflow_name, detail),
+        },
+    }
+
+
+def workflow_notifications_document(project: str, workflow_name: str, notify_ctls: list[Any]) -> dict[str, Any]:
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "WorkflowNotifications",
+        "metadata": {
+            "project": project,
+            "workflow": workflow_name,
+        },
+        "spec": {
+            "notify_ctls": notify_ctls,
+        },
+    }
+
+
+def workflow_trigger_payload(project: str, workflow_name: str, trigger: Any) -> Any:
+    if not isinstance(trigger, dict):
+        return trigger
+    payload = copy.deepcopy(trigger)
+    payload.pop("workflow_arg", None)
+    payload["workflow_ref"] = {
+        "path": f"projects/{safe_name(project)}/workflows/items/{safe_name(workflow_name)}.yaml",
+    }
+    return payload
+
+
+def workflow_triggers_document(project: str, workflow_name: str, detail: dict[str, Any]) -> dict[str, Any]:
+    preset = detail.get("raw", {}).get("preset") if isinstance(detail.get("raw"), dict) else None
+    webhooks = detail.get("raw", {}).get("webhooks") if isinstance(detail.get("raw"), dict) else None
+    spec = {
+        "preset": workflow_trigger_payload(project, workflow_name, preset),
+        "webhooks": [
+            workflow_trigger_payload(project, workflow_name, webhook)
+            for webhook in webhooks
+            if isinstance(webhooks, list)
+        ] if isinstance(webhooks, list) else webhooks,
+    }
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "WorkflowTriggers",
+        "metadata": {
+            "project": project,
+            "workflow": workflow_name,
+        },
+        "spec": {key: value for key, value in spec.items() if value is not None},
+        "live": {
+            "summary": {
+                "preset_count": detail.get("preset_count"),
+                "webhook_count": detail.get("webhook_count"),
+                "preset_items": detail.get("preset_items", []),
+                "webhook_items": detail.get("webhook_items", []),
+            },
+        },
+    }
+
+
+def split_workflow_assets(
+    project: str,
+    workflow_details: dict[str, Any],
+    webhooks: dict[str, Any],
+    project_dir: Path,
+    output_format: str,
+) -> dict[str, Any]:
+    workflow_index_items: list[dict[str, Any]] = []
+    script_index_items: list[dict[str, Any]] = []
+    notification_index_items: list[dict[str, Any]] = []
+    trigger_index_items: list[dict[str, Any]] = []
+
+    def extract_scripts(workflow_name: str, mapping: dict[str, Any], path_parts: list[str]) -> None:
+        for key, value in list(mapping.items()):
+            current_parts = [*path_parts, str(key)]
+            if key == "script" and isinstance(value, str) and value.strip():
+                normalized = normalize_script(value)
+                checksum = sha256_text(normalized)
+                script_name = f"{safe_name('.'.join(current_parts))}.sh"
+                ref_path = workflow_script_ref_path(project, workflow_name, script_name)
+                script_file = project_dir / "workflows" / "scripts" / safe_name(workflow_name) / script_name
+                script_file.parent.mkdir(parents=True, exist_ok=True)
+                script_file.write_text(normalized, encoding="utf-8")
+                script_ref = {
+                    "path": ref_path,
+                    "checksum": f"sha256:{checksum}",
+                }
+                mapping.pop(key, None)
+                mapping["script_ref"] = script_ref
+                script_index_items.append(
+                    {
+                        "workflow": workflow_name,
+                        "field": ".".join(current_parts),
+                        "path": ref_path,
+                        "checksum": f"sha256:{checksum}",
+                    }
+                )
+                continue
+            if isinstance(value, dict):
+                extract_scripts(workflow_name, value, current_parts)
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        extract_scripts(workflow_name, item, [*current_parts, str(index)])
+
+    for workflow_name, detail in workflow_details.items():
+        if not isinstance(detail, dict):
+            continue
+        document = workflow_gitops_document(project, str(workflow_name), detail)
+        spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+
+        notify_ctls = spec.pop("notify_ctls", None)
+        if isinstance(notify_ctls, list):
+            notification_path = f"projects/{safe_name(project)}/workflows/notifications/{safe_name(str(workflow_name))}.yaml"
+            spec["notifications_ref"] = {"path": notification_path}
+            write_data(
+                project_dir / "workflows" / "notifications" / data_filename(safe_name(str(workflow_name)), output_format),
+                workflow_notifications_document(project, str(workflow_name), notify_ctls),
+                output_format,
+            )
+            notification_index_items.append(
+                {
+                    "workflow": str(workflow_name),
+                    "path": notification_path,
+                    "count": len(notify_ctls),
+                }
+            )
+
+        if workflow_name in webhooks:
+            trigger_path = f"projects/{safe_name(project)}/workflows/triggers/{safe_name(str(workflow_name))}.yaml"
+            spec["triggers_ref"] = {"path": trigger_path}
+            write_data(
+                project_dir / "workflows" / "triggers" / data_filename(safe_name(str(workflow_name)), output_format),
+                workflow_triggers_document(project, str(workflow_name), webhooks[str(workflow_name)]),
+                output_format,
+            )
+            trigger_index_items.append(
+                {
+                    "workflow": str(workflow_name),
+                    "path": trigger_path,
+                    "preset_count": webhooks[str(workflow_name)].get("preset_count"),
+                    "webhook_count": webhooks[str(workflow_name)].get("webhook_count"),
+                }
+            )
+
+        extract_scripts(str(workflow_name), spec, ["spec"])
+        write_data(
+            project_dir / "workflows" / "items" / data_filename(safe_name(str(workflow_name)), output_format),
+            document,
+            output_format,
+        )
+        workflow_index_items.append(
+            {
+                "name": str(workflow_name),
+                "type": document.get("metadata", {}).get("type"),
+                "file": f"items/{safe_name(str(workflow_name))}.yaml",
+                "script_dir": f"scripts/{safe_name(str(workflow_name))}",
+                "triggers_file": f"triggers/{safe_name(str(workflow_name))}.yaml" if workflow_name in webhooks else "",
+                "notifications_file": (
+                    f"notifications/{safe_name(str(workflow_name))}.yaml" if isinstance(notify_ctls, list) else ""
+                ),
+                **workflow_summary(str(workflow_name), detail),
+            }
+        )
+
+    if script_index_items:
+        write_data(
+            project_dir / "workflows" / "scripts" / data_filename("index", output_format),
+            {
+                "count": len(script_index_items),
+                "items": sorted(script_index_items, key=lambda item: (str(item["workflow"]), str(item["field"]))),
+            },
+            output_format,
+        )
+    if notification_index_items:
+        write_data(
+            project_dir / "workflows" / "notifications" / data_filename("index", output_format),
+            {
+                "count": len(notification_index_items),
+                "items": sorted(notification_index_items, key=lambda item: str(item["workflow"])),
+            },
+            output_format,
+        )
+    if trigger_index_items:
+        write_data(
+            project_dir / "workflows" / "triggers" / data_filename("index", output_format),
+            {
+                "count": len(trigger_index_items),
+                "items": sorted(trigger_index_items, key=lambda item: str(item["workflow"])),
+            },
+            output_format,
+        )
+
+    return {
+        "count": len(workflow_index_items),
+        "items": sorted(workflow_index_items, key=lambda item: str(item["name"])),
+        "script_count": len(script_index_items),
+        "notification_count": len(notification_index_items),
+        "trigger_count": len(trigger_index_items),
+    }
+
+
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
@@ -852,22 +1195,19 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     if "iterations" in snapshot:
         write_data(project_dir / "iterations" / data_filename("index", output_format), snapshot["iterations"], output_format)
 
-    if "workflows" in snapshot:
-        write_data(project_dir / "workflows" / data_filename("index", output_format), snapshot["workflows"], output_format)
-
     workflow_details = snapshot.get("workflow_details", {}).get("items", {})
-    for workflow_name, detail in workflow_details.items():
-        write_data(
-            project_dir / "workflows" / "details" / data_filename(safe_name(str(workflow_name)), output_format),
-            detail,
-            output_format,
-        )
-
     webhooks = snapshot.get("webhooks", {}).get("items", {})
-    if webhooks:
-        write_data(project_dir / "webhooks" / data_filename("index", output_format), snapshot["webhooks"], output_format)
-    for workflow_name, detail in webhooks.items():
-        write_data(project_dir / "webhooks" / data_filename(safe_name(str(workflow_name)), output_format), detail, output_format)
+    if workflow_details:
+        workflow_index = split_workflow_assets(project, workflow_details, webhooks, project_dir, output_format)
+        source_index = snapshot.get("workflows") if isinstance(snapshot.get("workflows"), dict) else {}
+        workflow_index["source"] = {
+            key: value
+            for key, value in source_index.items()
+            if key not in {"items"}
+        }
+        write_data(project_dir / "workflows" / data_filename("index", output_format), workflow_index, output_format)
+    elif "workflows" in snapshot:
+        write_data(project_dir / "workflows" / data_filename("index", output_format), snapshot["workflows"], output_format)
 
     if "builds" in snapshot:
         builds = snapshot["builds"] if isinstance(snapshot["builds"], dict) else {}
@@ -1155,33 +1495,77 @@ async def run_apply(args: argparse.Namespace) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
-    if not args.file:
-        raise ValueError("--file is required for workflow apply")
-    workflow_file = Path(args.file).expanduser().resolve()
-    workflow = workflow_payload_from_file(workflow_file)
-    workflow_name = args.workflow or workflow.get("workflow_name") or workflow.get("workflow_key") or workflow.get("name")
-    if not workflow_name:
-        raise ValueError("--workflow is required when the file does not contain workflow_name/workflow_key/name")
-
-    if args.diff:
-        result = await zadig_workflow_diff(
-            workflow_name=str(workflow_name),
-            workflow=workflow,
+    if args.mode == "delete" and args.workflow and not args.file and not args.dir:
+        result = await zadig_workflow_delete(
+            workflow_name=args.workflow,
             project_key=args.project,
+            dry_run=not args.confirm,
+            confirm=args.confirm,
         )
-        print(result.get("diff", ""))
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
-    result = await zadig_workflow_apply(
-        workflow_name=str(workflow_name),
-        workflow=workflow,
-        project_key=args.project,
-        mode=args.mode,
-        dry_run=not args.confirm,
-        confirm=args.confirm,
-        allow_redacted=args.allow_redacted,
-    )
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if not args.file and not args.dir:
+        args.dir = str(default_config_dir(args.project, "workflows"))
+
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    workflow_files = desired_workflow_files(target_path)
+    if not workflow_files:
+        raise ValueError(f"no workflow YAML files found under {target_path}")
+
+    results = []
+    for workflow_file in workflow_files:
+        raw_document = load_data(workflow_file)
+        workflow = workflow_payload_from_file(workflow_file)
+        if isinstance(raw_document, dict) and raw_document.get("kind") == "Workflow":
+            workflow_name = workflow_name_from_document(raw_document)
+        else:
+            workflow_name = workflow.get("workflow_name") or workflow.get("workflow_key") or workflow.get("name")
+        workflow_name = args.workflow or workflow_name
+        if not workflow_name:
+            raise ValueError("--workflow is required when the file does not contain workflow_name/workflow_key/name")
+        if args.workflow and workflow_name != args.workflow:
+            continue
+        if args.diff:
+            result = await zadig_workflow_diff(
+                workflow_name=str(workflow_name),
+                workflow=workflow,
+                project_key=args.project,
+            )
+            results.append(result)
+            continue
+        if args.mode == "delete":
+            results.append(
+                await zadig_workflow_delete(
+                    workflow_name=str(workflow_name),
+                    project_key=args.project,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+            continue
+        results.append(
+            await zadig_workflow_apply(
+                workflow_name=str(workflow_name),
+                workflow=workflow,
+                project_key=args.project,
+                mode=args.mode,
+                dry_run=not args.confirm,
+                confirm=args.confirm,
+                allow_redacted=args.allow_redacted,
+            )
+        )
+
+    output = {
+        "project_key": args.project,
+        "entity": "workflow",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "target_path": str(target_path),
+        "desired_file_count": len(workflow_files),
+        "results": results,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def resolve_project_file(args: argparse.Namespace) -> Path | None:
