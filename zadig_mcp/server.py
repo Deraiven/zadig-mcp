@@ -701,6 +701,174 @@ def service_gitops_document(
     }
 
 
+def environment_name(value: dict[str, Any]) -> str:
+    return str(first_present(value, "env_key", "env_name", "name", "environment") or "")
+
+
+def environment_index_item(env: dict[str, Any], project: str, production: bool = False) -> dict[str, Any]:
+    name = environment_name(env)
+    services = env.get("services") if isinstance(env.get("services"), list) else []
+    variables = env.get("global_variables") if isinstance(env.get("global_variables"), list) else []
+    return {
+        "name": name,
+        "project_key": project,
+        "production": bool(first_present(env, "production") if first_present(env, "production") is not None else production),
+        "cluster_id": env.get("cluster_id"),
+        "namespace": env.get("namespace"),
+        "registry_id": env.get("registry_id"),
+        "status": env.get("status"),
+        "update_by": env.get("update_by"),
+        "update_time": env.get("update_time"),
+        "service_count": len(services),
+        "global_variable_count": len(variables),
+        "file": f"items/{safe_file_name(name)}.yaml",
+        "services_file": f"services/{safe_file_name(name)}/index.yaml",
+    }
+
+
+def environment_service_index_item(env_name: str, service: dict[str, Any]) -> dict[str, Any]:
+    service_name = str(first_present(service, "service_name", "name") or "")
+    containers = service.get("containers") if isinstance(service.get("containers"), list) else []
+    variables = service.get("variable_kvs") if isinstance(service.get("variable_kvs"), list) else []
+    return {
+        "name": service_name,
+        "env": env_name,
+        "type": service.get("type"),
+        "status": service.get("status"),
+        "container_count": len(containers),
+        "variable_count": len(variables),
+        "file": f"{safe_file_name(service_name)}.yaml",
+        "containers": [
+            {
+                "name": container.get("name", ""),
+                "image_name": container.get("image_name", ""),
+                "image": container.get("image", ""),
+            }
+            for container in containers
+            if isinstance(container, dict)
+        ],
+    }
+
+
+def environment_service_gitops_document(
+    project: str,
+    env_name: str,
+    service: dict[str, Any],
+    production: bool = False,
+) -> dict[str, Any]:
+    service_name = str(first_present(service, "service_name", "name") or "")
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "EnvironmentService",
+        "metadata": {
+            "project": project,
+            "env": env_name,
+            "service": service_name,
+            "production": production,
+        },
+        "spec": {
+            "service_name": service_name,
+            "type": service.get("type"),
+            "containers": service.get("containers") if isinstance(service.get("containers"), list) else [],
+            "variable_kvs": service.get("variable_kvs") if isinstance(service.get("variable_kvs"), list) else [],
+        },
+        "live": {
+            "summary": environment_service_index_item(env_name, service),
+        },
+    }
+
+
+def environment_gitops_document(
+    project: str,
+    env: dict[str, Any],
+    production: bool = False,
+) -> dict[str, Any]:
+    name = environment_name(env)
+    global_variables = env.get("global_variables") if isinstance(env.get("global_variables"), list) else []
+    spec = {
+        "env_key": env.get("env_key") or name,
+        "env_name": env.get("env_name") or name,
+        "cluster_id": env.get("cluster_id"),
+        "namespace": env.get("namespace"),
+        "registry_id": env.get("registry_id"),
+        "global_variables": global_variables,
+        "sub_env": env.get("sub_env") or env.get("subEnv") or [],
+        "services_ref": {
+            "path": f"projects/{safe_file_name(project)}/environments/services/{safe_file_name(name)}/index.yaml",
+        },
+    }
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "Environment",
+        "metadata": {
+            "project": project,
+            "name": name,
+            "production": bool(first_present(env, "production") if first_present(env, "production") is not None else production),
+        },
+        "spec": spec,
+        "live": {
+            "summary": environment_index_item(env, project, production),
+            "detail": env,
+        },
+    }
+
+
+def environment_desired_payload(env_name: str, environment: dict[str, Any], production: bool = False) -> dict[str, Any]:
+    payload = {
+        "env_key": environment.get("env_key") or environment.get("env_name") or env_name,
+        "env_name": environment.get("env_name") or environment.get("env_key") or env_name,
+        "cluster_id": environment.get("cluster_id"),
+        "namespace": environment.get("namespace"),
+        "registry_id": environment.get("registry_id"),
+        "global_variables": environment.get("global_variables") or [],
+        "sub_env": environment.get("sub_env") or environment.get("subEnv") or [],
+    }
+    if not production:
+        payload["env_configs"] = environment.get("env_configs") or environment.get("envConfigs") or []
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def environment_update_payload(environment: dict[str, Any], production: bool = False) -> dict[str, Any]:
+    allowed = ["registry_id", "env_name"] if production else ["registry_id"]
+    return {
+        key: copy.deepcopy(environment[key])
+        for key in allowed
+        if key in environment and environment[key] is not None
+    }
+
+
+def environment_service_desired_payload(service: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "service_name": first_present(service, "service_name", "name") or "",
+        "type": service.get("type"),
+        "containers": service.get("containers") if isinstance(service.get("containers"), list) else [],
+        "variable_kvs": service.get("variable_kvs") if isinstance(service.get("variable_kvs"), list) else [],
+    }
+
+
+async def environment_detail_or_none(project: str, env_name: str, production: bool = False) -> dict[str, Any] | None:
+    try:
+        payload = await client().request(
+            "GET",
+            f"{environment_prefix(production)}/{path_name(env_name)}",
+            project_key=project,
+        )
+        return payload if isinstance(payload, dict) else {}
+    except ZadigAPIError as exc:
+        if "HTTP 404" in str(exc) or "no documents in result" in str(exc):
+            return None
+        raise
+
+
+def environment_service_from_detail(detail: dict[str, Any], service_name: str) -> dict[str, Any] | None:
+    for service in detail.get("services") or []:
+        if not isinstance(service, dict):
+            continue
+        if first_present(service, "service_name", "name") == service_name:
+            return service
+    return None
+
+
 def chart_template_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         value = payload.get("chartTemplates") or payload.get("chart_templates") or payload.get("items") or payload.get("data")
@@ -1385,7 +1553,36 @@ async def zadig_project_snapshot(
     if "environments" in selected_sections:
         try:
             env_payload = await client().request("GET", environment_prefix(False), project_key=project)
-            snapshot["environments"] = redact_sensitive(env_payload)
+            env_details: dict[str, Any] = {}
+            env_items = [item for item in payload_items(env_payload) if isinstance(item, dict)]
+            index_items = [environment_index_item(item, project, False) for item in env_items]
+            for env_name, index_item in {
+                str(item["name"]): item for item in index_items if item.get("name")
+            }.items():
+                try:
+                    detail_payload = await client().request(
+                        "GET",
+                        f"{environment_prefix(False)}/{path_name(env_name)}",
+                        project_key=project,
+                    )
+                    detail = redact_sensitive(detail_payload)
+                    env_details[env_name] = environment_gitops_document(project, detail, False)
+                except Exception as exc:
+                    snapshot["errors"].append(
+                        {"section": "environment_details", "env_name": env_name, **error_summary(exc)}
+                    )
+                    env_details[env_name] = environment_gitops_document(project, index_item, False)
+            detailed_index_items: list[dict[str, Any]] = []
+            for name, fallback in {str(item["name"]): item for item in index_items if item.get("name")}.items():
+                document = env_details.get(name) if isinstance(env_details.get(name), dict) else {}
+                live = document.get("live") if isinstance(document.get("live"), dict) else {}
+                summary = live.get("summary") if isinstance(live.get("summary"), dict) else {}
+                detailed_index_items.append(summary or fallback)
+            snapshot["environments"] = {
+                "count": len(detailed_index_items),
+                "items": detailed_index_items,
+                "details": env_details,
+            }
         except Exception as exc:
             snapshot["errors"].append({"section": "environments", **error_summary(exc)})
 
@@ -2522,26 +2719,420 @@ async def zadig_environment_list(
 
 
 @mcp.tool()
-async def zadig_environment_service_get(
+async def zadig_environment_get(
     env_name: str,
-    service_name: str,
     project_key: str | None = None,
     production: bool = False,
 ) -> dict[str, Any]:
-    """Get service detail in a Zadig environment."""
+    """Get a Zadig environment detail."""
     project = default_project(project_key)
     payload = await client().request(
         "GET",
-        f"{environment_prefix(production)}/{path_name(env_name)}/services/{path_name(service_name)}",
+        f"{environment_prefix(production)}/{path_name(env_name)}",
         project_key=project,
     )
     return {
         "project_key": project,
         "production": production,
         "env_name": env_name,
-        "service_name": service_name,
-        "detail": payload,
+        "detail": redact_sensitive(payload),
     }
+
+
+@mcp.tool()
+async def zadig_environment_create(
+    environment: dict[str, Any],
+    env_name: str = "",
+    project_key: str | None = None,
+    production: bool = False,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create a Zadig environment. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    desired_name = env_name or str(first_present(environment, "env_key", "env_name", "name") or "")
+    payload = environment_desired_payload(desired_name, dict(environment), production)
+    if production:
+        payload = {
+            key: value
+            for key, value in payload.items()
+            if key in {"env_key", "env_name", "cluster_id", "namespace", "registry_id", "sub_env"}
+        }
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to create Zadig environment",
+            "project_key": project,
+            "production": production,
+            "env_name": desired_name,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request("POST", environment_prefix(production), project_key=project, json_body=payload)
+    return {"applied": True, "project_key": project, "production": production, "env_name": desired_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_environment_update(
+    env_name: str,
+    environment: dict[str, Any],
+    project_key: str | None = None,
+    production: bool = False,
+    update_global_variables: bool = True,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Update a Zadig environment. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = environment_update_payload(dict(environment), production)
+    global_variables = environment.get("global_variables") if isinstance(environment.get("global_variables"), list) else None
+    steps: list[dict[str, Any]] = []
+    if payload:
+        steps.append(
+            {
+                "action": "update_environment",
+                "method": "PUT",
+                "path": f"{environment_prefix(production)}/{path_name(env_name)}",
+                "payload": payload,
+            }
+        )
+    if update_global_variables and global_variables is not None:
+        steps.append(
+            {
+                "action": "update_global_variables",
+                "method": "PUT",
+                "path": f"{environment_prefix(production)}/{path_name(env_name)}/variable",
+                "payload": {"global_variables": global_variables},
+            }
+        )
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to update Zadig environment",
+            "project_key": project,
+            "production": production,
+            "env_name": env_name,
+            "steps": redact_sensitive(steps),
+        }
+
+    assert_no_redacted_placeholders(steps, allow_redacted)
+    results = []
+    for step in steps:
+        results.append(
+            {
+                "action": step["action"],
+                "result": await client().request(
+                    step["method"],
+                    step["path"],
+                    project_key=project,
+                    json_body=step["payload"],
+                ),
+            }
+        )
+    return {"applied": True, "project_key": project, "production": production, "env_name": env_name, "results": results}
+
+
+@mcp.tool()
+async def zadig_environment_delete(
+    env_name: str,
+    project_key: str | None = None,
+    production: bool = False,
+    is_delete: bool = False,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete a Zadig environment. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    params = {"isDelete": str(is_delete).lower()} if not production else {}
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to delete Zadig environment",
+            "project_key": project,
+            "production": production,
+            "env_name": env_name,
+            "is_delete": is_delete,
+        }
+    result = await client().request(
+        "DELETE",
+        f"{environment_prefix(production)}/{path_name(env_name)}",
+        project_key=project,
+        params=params,
+    )
+    return {"applied": True, "project_key": project, "production": production, "env_name": env_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_environment_diff(
+    environment: dict[str, Any],
+    env_name: str = "",
+    project_key: str | None = None,
+    production: bool = False,
+) -> dict[str, Any]:
+    """Diff current Zadig environment against desired Environment spec."""
+    project = default_project(project_key)
+    desired_name = env_name or str(first_present(environment, "env_key", "env_name", "name") or "")
+    live = await environment_detail_or_none(project, desired_name, production)
+    desired = environment_desired_payload(desired_name, dict(environment), production)
+    if live is None:
+        return {
+            "project_key": project,
+            "production": production,
+            "env_name": desired_name,
+            "exists": False,
+            "changed": True,
+            "diff": unified_diff("", json_for_diff(desired), f"{desired_name}:current", f"{desired_name}:desired"),
+            "desired": redact_sensitive(desired),
+        }
+
+    current = environment_desired_payload(desired_name, live, production)
+    diff = unified_diff(
+        json_for_diff(current),
+        json_for_diff(desired),
+        f"{desired_name}:current",
+        f"{desired_name}:desired",
+    )
+    return {
+        "project_key": project,
+        "production": production,
+        "env_name": desired_name,
+        "exists": True,
+        "changed": bool(diff.strip()),
+        "diff": diff,
+    }
+
+
+@mcp.tool()
+async def zadig_environment_apply(
+    environment: dict[str, Any],
+    env_name: str = "",
+    project_key: str | None = None,
+    production: bool = False,
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create or update a Zadig environment. mode can be auto, create, or update. Defaults to dry_run=true."""
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+    project = default_project(project_key)
+    desired_name = env_name or str(first_present(environment, "env_key", "env_name", "name") or "")
+    exists = await environment_detail_or_none(project, desired_name, production) is not None
+    action = "update" if mode == "auto" and exists else "create" if mode == "auto" else mode
+    if action == "create" and exists:
+        raise ValueError(f"environment {desired_name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"environment {desired_name!r} does not exist; use mode='create' or mode='auto'")
+
+    diff = await zadig_environment_diff(environment, desired_name, project, production)
+    if action == "update" and not diff.get("changed"):
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "environment exists and desired spec matches live state",
+            "project_key": project,
+            "production": production,
+            "env_name": desired_name,
+            "action": "none",
+            "diff": "",
+        }
+    if action == "create":
+        result = await zadig_environment_create(
+            environment,
+            desired_name,
+            project,
+            production,
+            dry_run,
+            confirm,
+            allow_redacted,
+        )
+    else:
+        result = await zadig_environment_update(
+            desired_name,
+            environment,
+            project,
+            production,
+            True,
+            dry_run,
+            confirm,
+            allow_redacted,
+        )
+    result["action"] = action
+    result["diff"] = diff.get("diff", "")
+    return result
+
+
+@mcp.tool()
+async def zadig_environment_service_list(
+    env_name: str,
+    project_key: str | None = None,
+    production: bool = False,
+) -> dict[str, Any]:
+    """List services deployed in a Zadig environment."""
+    project = default_project(project_key)
+    detail = await client().request(
+        "GET",
+        f"{environment_prefix(production)}/{path_name(env_name)}",
+        project_key=project,
+    )
+    services = detail.get("services") if isinstance(detail, dict) and isinstance(detail.get("services"), list) else []
+    return {
+        "project_key": project,
+        "production": production,
+        "env_name": env_name,
+        "count": len(services),
+        "items": [environment_service_index_item(env_name, item) for item in services if isinstance(item, dict)],
+    }
+
+
+@mcp.tool()
+async def zadig_environment_service_get(
+    env_name: str,
+    service_name: str,
+    project_key: str | None = None,
+    production: bool = False,
+    workload_type: str = "",
+) -> dict[str, Any]:
+    """Get service detail in a Zadig environment."""
+    project = default_project(project_key)
+    params = {"workLoadtype": workload_type} if workload_type else None
+    payload = await client().request(
+        "GET",
+        f"{environment_prefix(production)}/{path_name(env_name)}/services/{path_name(service_name)}",
+        project_key=project,
+        params=params,
+    )
+    return {
+        "project_key": project,
+        "production": production,
+        "env_name": env_name,
+        "service_name": service_name,
+        "detail": redact_sensitive(payload),
+    }
+
+
+@mcp.tool()
+async def zadig_environment_service_apply(
+    env_name: str,
+    service: dict[str, Any],
+    project_key: str | None = None,
+    production: bool = False,
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Add or update one service in a Zadig environment. Defaults to dry_run=true and requires confirm=true."""
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+    project = default_project(project_key)
+    payload_service = environment_service_desired_payload(dict(service))
+    service_name = str(payload_service.get("service_name") or "")
+    if not service_name:
+        raise ValueError("service must include service_name")
+
+    env_detail = await environment_detail_or_none(project, env_name, production)
+    if env_detail is None:
+        raise ValueError(f"environment {env_name!r} does not exist")
+    live_service = environment_service_from_detail(env_detail, service_name)
+    exists = live_service is not None
+    action = "update" if mode == "auto" and exists else "create" if mode == "auto" else mode
+    if action == "create" and exists:
+        raise ValueError(f"environment service {service_name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"environment service {service_name!r} does not exist; use mode='create' or mode='auto'")
+
+    live_payload = environment_service_desired_payload(live_service or {})
+    diff = unified_diff(
+        json_for_diff(live_payload),
+        json_for_diff(payload_service),
+        f"{env_name}/{service_name}:current",
+        f"{env_name}/{service_name}:desired",
+    )
+    result: dict[str, Any] = {
+        "applied": False,
+        "dry_run": dry_run,
+        "project_key": project,
+        "production": production,
+        "env_name": env_name,
+        "service_name": service_name,
+        "action": action if diff.strip() or action == "create" else "none",
+        "diff": diff,
+    }
+    if action == "update" and not diff.strip():
+        result["reason"] = "environment service exists and desired spec matches live state"
+        return result
+
+    endpoint = (
+        f"{environment_prefix(production)}/{path_name(env_name)}/services"
+        if action == "update"
+        else f"{environment_prefix(production)}/service/yaml"
+    )
+    payload = {"service_list": [payload_service]}
+    if action == "create":
+        payload["env_key"] = env_name
+
+    if dry_run or not confirm:
+        result["reason"] = "set dry_run=false and confirm=true to apply Zadig environment service"
+        result["payload"] = redact_sensitive(payload)
+        return result
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result["result"] = await client().request(
+        "PUT" if action == "update" else "POST",
+        endpoint,
+        project_key=project,
+        json_body=payload,
+    )
+    result["applied"] = True
+    return result
+
+
+@mcp.tool()
+async def zadig_environment_service_delete(
+    env_name: str,
+    service_name: str,
+    project_key: str | None = None,
+    production: bool = False,
+    not_delete_resource: bool = True,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete one service from a Zadig environment. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = {
+        "env_key": env_name,
+        "service_names": [service_name],
+        "not_delete_resource": not_delete_resource,
+    }
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to delete Zadig environment service",
+            "project_key": project,
+            "production": production,
+            "env_name": env_name,
+            "service_name": service_name,
+            "payload": payload,
+        }
+    result = await client().request(
+        "DELETE",
+        f"{environment_prefix(production)}/service/yaml",
+        project_key=project,
+        json_body=payload,
+    )
+    return {"applied": True, "project_key": project, "production": production, "env_name": env_name, "result": result}
 
 
 def main() -> None:

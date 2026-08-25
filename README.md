@@ -42,7 +42,16 @@ checked against the live `zadigx.shub.us` instance and Zadig
 - `zadig_service_set_variable`: upsert a single service variable. Defaults to dry run.
 - `zadig_service_set_image`: update a container image in service YAML. Defaults to dry run.
 - `zadig_environment_list`: list test or production environments.
+- `zadig_environment_get`: get one environment detail.
+- `zadig_environment_create`: create one environment. Defaults to dry run and requires `confirm=true`.
+- `zadig_environment_update`: update one environment registry/global variables. Defaults to dry run and requires `confirm=true`.
+- `zadig_environment_delete`: delete one environment. Defaults to dry run and requires `confirm=true`.
+- `zadig_environment_diff`: diff current environment against desired `Environment` spec.
+- `zadig_environment_apply`: create or update one environment. Defaults to dry run and requires `confirm=true`.
+- `zadig_environment_service_list`: list services in an environment.
 - `zadig_environment_service_get`: get service detail in an environment.
+- `zadig_environment_service_apply`: add or update one environment service. Defaults to dry run and requires `confirm=true`.
+- `zadig_environment_service_delete`: delete one environment service. Defaults to dry run and requires `confirm=true`.
 
 ## Config
 
@@ -159,6 +168,25 @@ checking the optional SHA-256 checksum.
 `project.yaml` is the top-level project document exported from live Zadig
 project metadata. It is currently read-only snapshot data plus a small
 GitOps-oriented `spec`.
+
+Environment snapshots are split for future CRUD support:
+
+```text
+projects/<project>/environments/
+  index.yaml
+  items/
+    <env>.yaml
+  services/
+    <env>/
+      index.yaml
+      <service>.yaml
+```
+
+`items/<env>.yaml` is a `kind: Environment` document for cluster, namespace,
+registry, global variables, and a `services_ref`. Environment service placement
+is exported separately as `kind: EnvironmentService` files under
+`services/<env>/`, so changing the environment and changing service deployment
+state remain reviewable as separate diffs.
 
 For a smaller export:
 
@@ -309,7 +337,59 @@ uv run zadig-gitops apply template \
 ```
 
 Template prune is intentionally unsupported because build templates are shared
-library resources. Delete templates one at a time after checking references.
+library resources and the blast radius can cross projects. Delete templates one
+at a time after checking references.
+
+Apply environment desired state from `projects/<project>/environments`. This is
+dry-run unless `--confirm` is set. Environment apply manages the environment
+object itself, including registry and global variables; deployed services are
+handled by `environment-service`.
+
+```bash
+uv run zadig-gitops apply environment \
+  --project bi \
+  --file ./zadig-config/projects/bi/environments/items/fat.yaml
+```
+
+Print only the environment diff:
+
+```bash
+uv run zadig-gitops apply environment \
+  --project bi \
+  --file ./zadig-config/projects/bi/environments/items/fat.yaml \
+  --diff
+```
+
+Delete an environment explicitly. By default this only deletes the Zadig
+environment record where supported; add `--delete-resources` only when the
+underlying Kubernetes namespace/resources should also be removed.
+
+```bash
+uv run zadig-gitops apply environment \
+  --project bi \
+  --environment fat \
+  --mode delete
+```
+
+Apply services deployed inside an environment:
+
+```bash
+uv run zadig-gitops apply environment-service \
+  --project bi \
+  --environment fat \
+  --dir ./zadig-config/projects/bi/environments/services/fat
+```
+
+Delete one service from an environment. By default `not_delete_resource=true`;
+add `--delete-resources` to ask Zadig to delete underlying Kubernetes resources.
+
+```bash
+uv run zadig-gitops apply environment-service \
+  --project bi \
+  --environment fat \
+  --service csp-v1-web-fe \
+  --mode delete
+```
 
 Plan project changes from `project.yaml`. Project apply is intentionally
 plan-only for now: create/update/delete modes only compare desired config with

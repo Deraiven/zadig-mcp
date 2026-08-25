@@ -10,16 +10,23 @@ from typing import Any
 
 import yaml
 
-from .client import ZadigAPIError, path_name, service_prefix
+from .client import ZadigAPIError, environment_prefix, path_name, service_prefix
 from .server import (
     DEFAULT_SNAPSHOT_SECTIONS,
     assert_no_redacted_placeholders,
     build_template_desired_payload,
     build_template_items_from_payload,
     client,
+    environment_service_gitops_document,
+    environment_service_index_item,
     first_present,
     redact_sensitive,
     summarize_build_template,
+    zadig_environment_apply,
+    zadig_environment_delete,
+    zadig_environment_diff,
+    zadig_environment_service_apply,
+    zadig_environment_service_delete,
     zadig_project_snapshot,
     zadig_project_apply_plan,
     zadig_build_apply,
@@ -145,6 +152,24 @@ def build_template_document_from_file(path: Path) -> dict[str, Any]:
     raise ValueError(f"build template file {path} must have kind: BuildTemplate")
 
 
+def environment_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"environment file {path} must contain a mapping")
+    if data.get("kind") != "Environment":
+        raise ValueError(f"environment file {path} must have kind: Environment")
+    return data
+
+
+def environment_service_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"environment service file {path} must contain a mapping")
+    if data.get("kind") != "EnvironmentService":
+        raise ValueError(f"environment service file {path} must have kind: EnvironmentService")
+    return data
+
+
 def build_name_from_document(document: dict[str, Any]) -> str:
     metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
     spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
@@ -184,6 +209,57 @@ def build_template_spec_from_document(document: dict[str, Any]) -> dict[str, Any
     return spec
 
 
+def environment_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    name = metadata.get("name") or spec.get("env_key") or spec.get("env_name")
+    if not name:
+        raise ValueError("environment document must contain metadata.name or spec.env_key")
+    return str(name)
+
+
+def environment_production_from_document(document: dict[str, Any]) -> bool:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    return bool(metadata.get("production", False))
+
+
+def environment_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    if not spec:
+        raise ValueError("environment document must contain spec")
+    return spec
+
+
+def environment_service_env_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    env_name = metadata.get("env") or spec.get("env_key") or spec.get("env_name")
+    if not env_name:
+        raise ValueError("environment service document must contain metadata.env")
+    return str(env_name)
+
+
+def environment_service_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    service_name = metadata.get("service") or spec.get("service_name") or spec.get("name")
+    if not service_name:
+        raise ValueError("environment service document must contain metadata.service or spec.service_name")
+    return str(service_name)
+
+
+def environment_service_production_from_document(document: dict[str, Any]) -> bool:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    return bool(metadata.get("production", False))
+
+
+def environment_service_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    if not spec:
+        raise ValueError("environment service document must contain spec")
+    return spec
+
+
 def template_script_ref_path(template_name: str, script_name: str) -> str:
     return f"templates/build-templates/scripts/{safe_name(template_name)}/{script_name}"
 
@@ -201,6 +277,18 @@ def config_root_for(path: Path) -> Path:
         if (parent / "projects").is_dir():
             return parent
     return Path.cwd()
+
+
+def default_config_dir(project: str, *parts: str) -> Path:
+    cwd = Path.cwd()
+    candidates = [
+        cwd / "zadig-config",
+        cwd.parent / "zadig-config",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate / "projects" / safe_name(project) / Path(*parts)
+    return candidates[0] / "projects" / safe_name(project) / Path(*parts)
 
 
 def build_script_ref_path(project: str, script_name: str) -> str:
@@ -367,6 +455,41 @@ def desired_build_template_files(path: Path) -> list[Path]:
     return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
 
 
+def desired_environment_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
+def desired_environment_service_files(path: Path, env_name: str = "") -> list[Path]:
+    if path.is_file():
+        return [path]
+    if not path.exists():
+        return []
+    if env_name and (path / env_name).is_dir():
+        path = path / env_name
+    if (path / "services").is_dir():
+        path = path / "services"
+        if env_name and (path / env_name).is_dir():
+            path = path / env_name
+    if env_name and (path / "environments" / "services" / env_name).is_dir():
+        path = path / "environments" / "services" / env_name
+    if (path / "environments" / "services").is_dir():
+        path = path / "environments" / "services"
+        if env_name and (path / env_name).is_dir():
+            path = path / env_name
+    if any(item.is_dir() for item in path.iterdir()):
+        return sorted(
+            item
+            for child in path.iterdir()
+            if child.is_dir()
+            for item in child.glob("*.yaml")
+            if item.is_file() and item.name != "index.yaml"
+        )
+    return sorted(item for item in path.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
 async def live_build_names(project: str) -> set[str]:
     payload = await client().request(
         "GET",
@@ -398,6 +521,17 @@ async def live_service_names(project: str, production: bool) -> set[str]:
         str(item.get("service_name") or item.get("name"))
         for item in iter_services(payload)
         if item.get("service_name") or item.get("name")
+    }
+
+
+async def live_environment_names(project: str, production: bool) -> set[str]:
+    payload = await client().request("GET", environment_prefix(production), project_key=project)
+    items = payload if isinstance(payload, list) else []
+    return {
+        str(first_present(item, "env_key", "env_name", "name"))
+        for item in items
+        if isinstance(item, dict)
+        if first_present(item, "env_key", "env_name", "name")
     }
 
 
@@ -805,11 +939,71 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
             )
 
     if "environments" in snapshot:
-        write_data(
-            project_dir / "environments" / data_filename("index", output_format),
-            snapshot["environments"],
-            output_format,
-        )
+        environments = snapshot["environments"] if isinstance(snapshot["environments"], dict) else {}
+        environment_index = {
+            key: value
+            for key, value in environments.items()
+            if key not in {"details"}
+        }
+        write_data(project_dir / "environments" / data_filename("index", output_format), environment_index, output_format)
+        for env_name, document in (environments.get("details") or {}).items():
+            if not isinstance(document, dict):
+                continue
+            spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+            live = document.get("live") if isinstance(document.get("live"), dict) else {}
+            summary = live.get("summary") if isinstance(live.get("summary"), dict) else {}
+            production = bool(
+                document.get("metadata", {}).get("production")
+                if isinstance(document.get("metadata"), dict)
+                else summary.get("production", False)
+            )
+            detail_services = []
+            detail = live.get("detail") if isinstance(live.get("detail"), dict) else {}
+            if isinstance(detail.get("services"), list):
+                detail_services = detail["services"]
+            elif isinstance(spec.get("services"), list):
+                detail_services = spec["services"]
+            elif isinstance(document.get("services"), list):
+                detail_services = document["services"]
+
+            environment_document = copy.deepcopy(document)
+            environment_live = environment_document.get("live") if isinstance(environment_document.get("live"), dict) else {}
+            environment_live.pop("detail", None)
+            environment_document["live"] = environment_live
+            write_data(
+                project_dir / "environments" / "items" / data_filename(safe_name(str(env_name)), output_format),
+                environment_document,
+                output_format,
+            )
+
+            service_items = [
+                environment_service_index_item(str(env_name), service)
+                for service in detail_services
+                if isinstance(service, dict)
+            ]
+            service_dir = project_dir / "environments" / "services" / safe_name(str(env_name))
+            write_data(
+                service_dir / data_filename("index", output_format),
+                {
+                    "count": len(service_items),
+                    "project_key": project,
+                    "env": str(env_name),
+                    "production": production,
+                    "items": service_items,
+                },
+                output_format,
+            )
+            for service in detail_services:
+                if not isinstance(service, dict):
+                    continue
+                service_name = first_present(service, "service_name", "name")
+                if not service_name:
+                    continue
+                write_data(
+                    service_dir / data_filename(safe_name(str(service_name)), output_format),
+                    environment_service_gitops_document(project, str(env_name), service, production),
+                    output_format,
+                )
 
     if "releases" in snapshot:
         write_data(project_dir / "releases" / data_filename("index", output_format), snapshot["releases"], output_format)
@@ -943,6 +1137,16 @@ async def run_apply(args: argparse.Namespace) -> None:
 
     if args.entity == "template":
         result = await run_apply_template(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.entity == "environment":
+        result = await run_apply_environment(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.entity == "environment-service":
+        result = await run_apply_environment_service(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
@@ -1176,6 +1380,257 @@ async def run_apply_template(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+async def run_apply_environment(args: argparse.Namespace) -> dict[str, Any]:
+    project = args.project
+    production = bool(args.production) if args.production is not None else False
+    if args.mode == "delete" and args.environment and not args.file and not args.dir:
+        return {
+            "project_key": project,
+            "entity": "environment",
+            "dry_run": not args.confirm,
+            "confirm": args.confirm,
+            "desired_file_count": 0,
+            "results": [
+                await zadig_environment_delete(
+                    env_name=args.environment,
+                    project_key=project,
+                    production=production,
+                    is_delete=args.delete_resources,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            ],
+            "prune_results": [],
+        }
+    inferred_dir = False
+    if not args.file and not args.dir:
+        args.dir = str(default_config_dir(project, "environments"))
+        inferred_dir = True
+    if args.prune and not args.dir:
+        raise ValueError("--prune requires --dir so the desired environment set is explicit")
+
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    files = desired_environment_files(target_path)
+    if not files:
+        raise ValueError(f"no environment YAML files found under {target_path}")
+
+    results = []
+    desired_names: set[str] = set()
+    productions_by_env: dict[str, bool] = {}
+    for env_file in files:
+        document = environment_document_from_file(env_file)
+        env_name = environment_name_from_document(document)
+        env_production = environment_production_from_document(document)
+        desired_names.add(env_name)
+        productions_by_env[env_name] = env_production
+        if args.environment and env_name != args.environment:
+            continue
+        if args.mode == "delete":
+            results.append(
+                await zadig_environment_delete(
+                    env_name=env_name,
+                    project_key=project,
+                    production=env_production,
+                    is_delete=args.delete_resources,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+            continue
+
+        env_spec = environment_spec_from_document(document)
+        if args.diff:
+            results.append(
+                await zadig_environment_diff(
+                    environment=env_spec,
+                    env_name=env_name,
+                    project_key=project,
+                    production=env_production,
+                )
+            )
+            continue
+        results.append(
+            await zadig_environment_apply(
+                environment=env_spec,
+                env_name=env_name,
+                project_key=project,
+                production=env_production,
+                mode=args.mode,
+                dry_run=not args.confirm,
+                confirm=args.confirm,
+                allow_redacted=args.allow_redacted,
+            )
+        )
+
+    prune_results = []
+    if args.prune:
+        for live_name in sorted(await live_environment_names(project, production)):
+            if args.environment and live_name != args.environment:
+                continue
+            if live_name in desired_names and productions_by_env.get(live_name, production) == production:
+                continue
+            prune_results.append(
+                await zadig_environment_delete(
+                    env_name=live_name,
+                    project_key=project,
+                    production=production,
+                    is_delete=args.delete_resources,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+
+    if args.environment and not results and args.mode != "delete":
+        raise ValueError(f"environment {args.environment!r} not found in desired files under {target_path}")
+
+    return {
+        "project_key": project,
+        "entity": "environment",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "inferred_dir": inferred_dir,
+        "target_path": str(target_path),
+        "desired_file_count": len(files),
+        "results": results,
+        "prune_results": prune_results,
+    }
+
+
+async def run_apply_environment_service(args: argparse.Namespace) -> dict[str, Any]:
+    project = args.project
+    production = bool(args.production) if args.production is not None else False
+    if args.mode == "delete" and args.environment and args.service and not args.file and not args.dir:
+        return {
+            "project_key": project,
+            "entity": "environment-service",
+            "dry_run": not args.confirm,
+            "confirm": args.confirm,
+            "desired_file_count": 0,
+            "results": [
+                await zadig_environment_service_delete(
+                    env_name=args.environment,
+                    service_name=args.service,
+                    project_key=project,
+                    production=production,
+                    not_delete_resource=not args.delete_resources,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            ],
+            "prune_results": [],
+        }
+    inferred_dir = False
+    if not args.file and not args.dir:
+        if not args.environment:
+            raise ValueError("--environment is required when --file/--dir is omitted for environment-service apply")
+        args.dir = str(default_config_dir(project, "environments", "services", args.environment))
+        inferred_dir = True
+    if args.prune and (not args.dir or not args.environment):
+        raise ValueError("--prune for environment-service requires --dir and --environment")
+
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    files = desired_environment_service_files(target_path, args.environment or "")
+    if not files:
+        raise ValueError(f"no environment service YAML files found under {target_path}")
+
+    results = []
+    desired_names: set[str] = set()
+    for service_file in files:
+        document = environment_service_document_from_file(service_file)
+        env_name = environment_service_env_from_document(document)
+        service_name = environment_service_name_from_document(document)
+        env_production = environment_service_production_from_document(document)
+        desired_names.add(service_name)
+        if args.environment and env_name != args.environment:
+            continue
+        if args.service and service_name != args.service:
+            continue
+        if args.mode == "delete":
+            results.append(
+                await zadig_environment_service_delete(
+                    env_name=env_name,
+                    service_name=service_name,
+                    project_key=project,
+                    production=env_production,
+                    not_delete_resource=not args.delete_resources,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+            continue
+        service_spec = environment_service_spec_from_document(document)
+        if args.diff:
+            service_spec.setdefault("service_name", service_name)
+            results.append(
+                await zadig_environment_service_apply(
+                    env_name=env_name,
+                    service=service_spec,
+                    project_key=project,
+                    production=env_production,
+                    mode=args.mode,
+                    dry_run=True,
+                    confirm=False,
+                    allow_redacted=args.allow_redacted,
+                )
+            )
+            continue
+        results.append(
+            await zadig_environment_service_apply(
+                env_name=env_name,
+                service=service_spec,
+                project_key=project,
+                production=env_production,
+                mode=args.mode,
+                dry_run=not args.confirm,
+                confirm=args.confirm,
+                allow_redacted=args.allow_redacted,
+            )
+        )
+
+    prune_results = []
+    if args.prune:
+        live_payload = await client().request(
+            "GET",
+            f"{environment_prefix(production)}/{path_name(args.environment)}",
+            project_key=project,
+        )
+        live_services = live_payload.get("services") if isinstance(live_payload, dict) else []
+        for live_service in live_services if isinstance(live_services, list) else []:
+            if not isinstance(live_service, dict):
+                continue
+            live_name = str(first_present(live_service, "service_name", "name") or "")
+            if not live_name or live_name in desired_names:
+                continue
+            if args.service and live_name != args.service:
+                continue
+            prune_results.append(
+                await zadig_environment_service_delete(
+                    env_name=args.environment,
+                    service_name=live_name,
+                    project_key=project,
+                    production=production,
+                    not_delete_resource=not args.delete_resources,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+
+    if (args.environment or args.service) and not results and args.mode != "delete":
+        raise ValueError(f"no matching environment service desired files found under {target_path}")
+
+    return {
+        "project_key": project,
+        "entity": "environment-service",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "inferred_dir": inferred_dir,
+        "target_path": str(target_path),
+        "desired_file_count": len(files),
+        "results": results,
+        "prune_results": prune_results,
+    }
+
+
 async def run_apply_service(args: argparse.Namespace) -> dict[str, Any]:
     project = args.project
     if not args.file and not args.dir:
@@ -1274,7 +1729,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "entity",
         nargs="?",
-        choices=["workflow", "service", "project", "build", "template"],
+        choices=["workflow", "service", "project", "build", "template", "environment", "environment-service"],
         default="workflow",
         help="Entity type to apply or plan.",
     )
@@ -1283,6 +1738,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--service", help="Service name filter for service apply.")
     apply.add_argument("--build", help="Build name filter for build apply/delete.")
     apply.add_argument("--template", help="Build template name or id filter for template apply/delete.")
+    apply.add_argument("--environment", help="Environment name/key filter for environment apply/delete.")
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
     apply.add_argument("--dir", help="Directory containing item YAML files, for example projects/<project>/services or templates/build-templates.")
     apply.add_argument("--mode", choices=["auto", "create", "update", "delete"], default="auto", help="Apply mode.")
@@ -1292,6 +1748,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="For service prune, choose production or test services. Defaults to productions present in desired files.",
+    )
+    apply.add_argument(
+        "--delete-resources",
+        action="store_true",
+        help="For environment and environment-service delete, also delete underlying K8s resources where Zadig supports it.",
     )
     apply.add_argument("--confirm", action="store_true", help="Apply the change. Omit for dry-run.")
     apply.add_argument("--diff", action="store_true", help="Only print diff between Zadig and the file.")
