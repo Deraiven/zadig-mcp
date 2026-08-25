@@ -184,6 +184,10 @@ def build_template_spec_from_document(document: dict[str, Any]) -> dict[str, Any
     return spec
 
 
+def template_script_ref_path(template_name: str, script_name: str) -> str:
+    return f"templates/build-templates/scripts/{safe_name(template_name)}/{script_name}"
+
+
 def normalize_script(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -235,6 +239,55 @@ def expand_build_script_ref(document: dict[str, Any], document_path: Path) -> di
                 f"{document_path} build script checksum mismatch for {ref_path}: expected sha256:{expected}, got sha256:{actual}"
             )
     spec["build_script"] = script
+    return spec
+
+
+def expand_template_script_refs(document: dict[str, Any], document_path: Path) -> dict[str, Any]:
+    spec = copy.deepcopy(build_template_spec_from_document(document))
+
+    def expand_in_mapping(mapping: dict[str, Any], location: str) -> None:
+        for key, value in list(mapping.items()):
+            if key.endswith("_ref") and isinstance(value, dict):
+                target_key = key.removesuffix("_ref")
+                ref_path = value.get("path")
+                if not ref_path:
+                    raise ValueError(f"{document_path} {location}.{key} requires path")
+                ref = Path(str(ref_path))
+                if ref.is_absolute():
+                    raise ValueError(f"{document_path} {location}.{key}.path must be relative")
+
+                root = config_root_for(document_path)
+                script_path = (root / ref).resolve()
+                if not script_path.is_file():
+                    fallback = (document_path.parent / ref).resolve()
+                    if fallback.is_file():
+                        script_path = fallback
+                    else:
+                        raise ValueError(f"{document_path} references missing template script {ref_path}")
+
+                script = normalize_script(script_path.read_text(encoding="utf-8"))
+                checksum = value.get("checksum")
+                if checksum:
+                    expected = str(checksum).replace("sha256:", "")
+                    actual = sha256_text(script)
+                    if expected != actual:
+                        raise ValueError(
+                            f"{document_path} template script checksum mismatch for {ref_path}: "
+                            f"expected sha256:{expected}, got sha256:{actual}"
+                        )
+                mapping[target_key] = script
+                mapping.pop(key, None)
+                continue
+
+            if isinstance(value, dict):
+                expand_in_mapping(value, f"{location}.{key}" if location else str(key))
+                continue
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        expand_in_mapping(item, f"{location}.{key}[{index}]" if location else f"{key}[{index}]")
+
+    expand_in_mapping(spec, "spec")
     return spec
 
 
@@ -579,6 +632,77 @@ def extract_project_build_scripts(
     }
 
 
+def extract_build_template_scripts(
+    details: dict[str, dict[str, Any]],
+    template_dir: Path,
+    output_format: str,
+) -> dict[str, Any]:
+    scripts_index: list[dict[str, Any]] = []
+
+    def extract_from_mapping(template_name: str, mapping: dict[str, Any], field_path: str) -> None:
+        for key, value in list(mapping.items()):
+            current_path = f"{field_path}.{key}" if field_path else str(key)
+            if isinstance(value, dict):
+                extract_from_mapping(template_name, value, current_path)
+                continue
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        extract_from_mapping(template_name, item, f"{current_path}[{index}]")
+                continue
+            if key != "scripts" and not key.endswith("_scripts"):
+                continue
+            if not isinstance(value, str) or not value.strip():
+                continue
+
+            normalized = normalize_script(value)
+            checksum = sha256_text(normalized)
+            script_name = f"{safe_name(current_path)}.sh"
+            ref_path = template_script_ref_path(template_name, script_name)
+            script_file = template_dir / "scripts" / safe_name(template_name) / script_name
+            script_file.parent.mkdir(parents=True, exist_ok=True)
+            script_file.write_text(normalized, encoding="utf-8")
+
+            script_ref = {
+                "path": ref_path,
+                "checksum": f"sha256:{checksum}",
+            }
+            mapping.pop(key, None)
+            mapping[f"{key}_ref"] = script_ref
+            scripts_index.append(
+                {
+                    "template": template_name,
+                    "field": current_path,
+                    "path": ref_path,
+                    "checksum": f"sha256:{checksum}",
+                }
+            )
+
+    for template_id, item in details.items():
+        detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+        if not detail:
+            continue
+        template_name = str(item.get("name") or detail.get("name") or template_id)
+        extract_from_mapping(template_name, detail, "spec")
+
+    if not scripts_index:
+        return {}
+
+    scripts_index = sorted(scripts_index, key=lambda item: (str(item["template"]), str(item["field"])))
+    write_data(
+        template_dir / "scripts" / data_filename("index", output_format),
+        {
+            "count": len(scripts_index),
+            "items": scripts_index,
+        },
+        output_format,
+    )
+    return {
+        "count": len(scripts_index),
+        "items": scripts_index,
+    }
+
+
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
@@ -764,6 +888,7 @@ async def run_snapshot_template(args: argparse.Namespace) -> None:
                 }
             )
 
+    script_index = extract_build_template_scripts(details, template_dir, args.format)
     index = {
         "count": len(details),
         "scope": "all" if not args.template and not args.query else "filtered",
@@ -773,6 +898,8 @@ async def run_snapshot_template(args: argparse.Namespace) -> None:
             if isinstance(item.get("detail"), dict)
         ],
     }
+    if script_index:
+        index["scripts"] = script_index
     write_data(template_dir / data_filename("index", args.format), index, args.format)
     for template_id, item in details.items():
         template_name = item.get("name") or template_id
@@ -791,6 +918,7 @@ async def run_snapshot_template(args: argparse.Namespace) -> None:
             "sections": ["build_templates"],
             "redacted": True,
             "count": len(details),
+            "script_count": script_index.get("count", 0) if script_index else 0,
             "error_count": len(errors),
         },
         args.format,
@@ -1007,7 +1135,7 @@ async def run_apply_template(args: argparse.Namespace) -> dict[str, Any]:
         template_id = build_template_id_from_document(document)
         if args.template and template_name != args.template and template_id != args.template:
             continue
-        template_spec = build_template_spec_from_document(document)
+        template_spec = expand_template_script_refs(document, template_file)
         if args.diff:
             results.append(
                 await zadig_build_template_diff(

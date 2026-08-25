@@ -131,6 +131,14 @@ Per-template files under `templates/build-templates/` are exported as
 payload; `metadata.id` keeps the live template ID when known, and `metadata.name`
 is used to resolve the template when the ID is absent.
 
+When a build template contains non-empty script fields such as `scripts`,
+`pre_build.scripts`, or `post_build.scripts`, `snapshot-template` writes those
+scripts under `templates/build-templates/scripts/<template>/` and replaces the
+inline value with a `*_ref` object containing the path and SHA-256 checksum.
+Template apply expands those refs back into the Zadig template payload after
+verifying the checksum. This keeps template metadata reviewable while preserving
+exact scripts as separate files.
+
 `_snapshot/errors.yaml` is not Zadig configuration. It records snapshot-time API
 failures or unsupported sections so GitOps reviewers can tell whether an export
 is complete.
