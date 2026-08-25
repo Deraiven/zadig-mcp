@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +14,18 @@ from .client import ZadigAPIError, path_name, service_prefix
 from .server import (
     DEFAULT_SNAPSHOT_SECTIONS,
     assert_no_redacted_placeholders,
+    build_template_desired_payload,
+    build_template_items_from_payload,
     client,
+    first_present,
+    redact_sensitive,
+    summarize_build_template,
     zadig_project_snapshot,
     zadig_project_apply_plan,
     zadig_build_apply,
+    zadig_build_template_apply,
+    zadig_build_template_delete,
+    zadig_build_template_diff,
     zadig_workflow_apply,
     zadig_workflow_diff,
 )
@@ -115,6 +124,27 @@ def build_document_from_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def build_template_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"build template file {path} must contain a mapping")
+    if data.get("kind") == "BuildTemplate":
+        return data
+    if isinstance(data.get("detail"), dict):
+        detail = data["detail"]
+        return {
+            "apiVersion": "zadig.storehub.io/v1alpha1",
+            "kind": "BuildTemplate",
+            "metadata": {
+                "name": data.get("name") or detail.get("name"),
+                "id": detail.get("id"),
+            },
+            "spec": detail,
+            "live": data,
+        }
+    raise ValueError(f"build template file {path} must have kind: BuildTemplate")
+
+
 def build_name_from_document(document: dict[str, Any]) -> str:
     metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
     spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
@@ -128,6 +158,29 @@ def build_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
     spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
     if not spec:
         raise ValueError("build document must contain spec")
+    return spec
+
+
+def build_template_name_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    name = metadata.get("name") or spec.get("name") or document.get("template_name")
+    if not name:
+        raise ValueError("build template document must contain metadata.name or spec.name")
+    return str(name)
+
+
+def build_template_id_from_document(document: dict[str, Any]) -> str:
+    metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    template_id = metadata.get("id") or spec.get("id") or spec.get("_id") or document.get("template_id")
+    return str(template_id) if template_id else ""
+
+
+def build_template_spec_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else {}
+    if not spec:
+        raise ValueError("build template document must contain spec")
     return spec
 
 
@@ -252,6 +305,13 @@ def desired_build_files(path: Path) -> list[Path]:
         return [path]
     items_dir = path / "items" if (path / "items").is_dir() else path
     return sorted(item for item in items_dir.glob("*.yaml") if item.is_file())
+
+
+def desired_build_template_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
 
 
 async def live_build_names(project: str) -> set[str]:
@@ -414,6 +474,27 @@ async def delete_service(project: str, service_name: str, production: bool, *, d
     return result
 
 
+def build_template_gitops_document(
+    template_id: str,
+    template_name: str,
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    spec = build_template_desired_payload(detail)
+    spec.setdefault("name", template_name)
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "BuildTemplate",
+        "metadata": {
+            "name": template_name,
+            "id": template_id,
+        },
+        "spec": spec,
+        "live": {
+            "summary": summarize_build_template({"id": template_id, **detail}),
+        },
+    }
+
+
 def extract_project_build_scripts(
     project: str,
     build_details: dict[str, Any],
@@ -569,9 +650,10 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
         )
     for template_id, item in build_templates.get("items", {}).items():
         template_name = item.get("name") or template_id
+        detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
         write_data(
             shared_template_dir / data_filename(f"{safe_name(str(template_name))}.{safe_name(str(template_id))}", output_format),
-            item,
+            build_template_gitops_document(str(template_id), str(template_name), detail),
             output_format,
         )
 
@@ -626,6 +708,100 @@ async def run_snapshot(args: argparse.Namespace) -> None:
     print(f"error_count={error_count}")
 
 
+async def run_snapshot_template(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output).expanduser().resolve()
+    template_dir = output_dir / "templates" / "build-templates"
+    errors: list[dict[str, Any]] = []
+
+    payload = await client().request(
+        "GET",
+        "/api/aslan/template/build",
+        params={"pageNum": args.page_num, "pageSize": args.page_size},
+    )
+    template_items = build_template_items_from_payload(payload)
+    needle = args.query.lower().strip()
+    selected = []
+    for item in template_items:
+        template_id = str(first_present(item, "id", "_id") or "")
+        template_name = str(first_present(item, "name", "template_name", "templateName") or "")
+        if args.template and args.template not in {template_id, template_name}:
+            continue
+        if needle and needle not in json.dumps(item, ensure_ascii=False).lower():
+            continue
+        selected.append((template_id, template_name, item))
+
+    details: dict[str, dict[str, Any]] = {}
+    for template_id, template_name, item in selected:
+        if not template_id:
+            errors.append(
+                {
+                    "section": "build_templates",
+                    "template_name": template_name,
+                    "type": "MissingID",
+                    "message": "template list item did not include id",
+                }
+            )
+            continue
+        try:
+            detail_payload = await client().request(
+                "GET",
+                f"/api/aslan/template/build/{path_name(template_id)}",
+            )
+            detail = redact_sensitive(detail_payload)
+            details[template_id] = {
+                "name": template_name or str(first_present(detail, "name", "template_name", "templateName") or template_id),
+                "detail": detail,
+                "list": redact_sensitive(item),
+            }
+        except Exception as exc:
+            errors.append(
+                {
+                    "section": "build_templates",
+                    "template_id": template_id,
+                    "template_name": template_name,
+                    "type": exc.__class__.__name__,
+                    "message": str(exc),
+                }
+            )
+
+    index = {
+        "count": len(details),
+        "scope": "all" if not args.template and not args.query else "filtered",
+        "summary": [
+            summarize_build_template({"id": template_id, **item["detail"]})
+            for template_id, item in details.items()
+            if isinstance(item.get("detail"), dict)
+        ],
+    }
+    write_data(template_dir / data_filename("index", args.format), index, args.format)
+    for template_id, item in details.items():
+        template_name = item.get("name") or template_id
+        detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+        write_data(
+            template_dir / data_filename(f"{safe_name(str(template_name))}.{safe_name(str(template_id))}", args.format),
+            build_template_gitops_document(str(template_id), str(template_name), detail),
+            args.format,
+        )
+
+    snapshot_dir = output_dir / "_snapshot"
+    write_data(
+        snapshot_dir / data_filename("build-template-metadata", args.format),
+        {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "sections": ["build_templates"],
+            "redacted": True,
+            "count": len(details),
+            "error_count": len(errors),
+        },
+        args.format,
+    )
+    write_data(snapshot_dir / data_filename("build-template-errors", args.format), errors, args.format)
+
+    print(f"wrote build template snapshot to {template_dir}")
+    print(f"count={len(details)}")
+    print(f"error_count={len(errors)}")
+
+
 async def run_apply(args: argparse.Namespace) -> None:
     if args.entity == "project":
         result = await run_apply_project(args)
@@ -634,6 +810,11 @@ async def run_apply(args: argparse.Namespace) -> None:
 
     if args.entity == "build":
         result = await run_apply_build(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.entity == "template":
+        result = await run_apply_template(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
@@ -792,6 +973,81 @@ async def run_apply_build(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+async def run_apply_template(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mode == "delete" and args.template and not args.file and not args.dir:
+        return {
+            "entity": "template",
+            "dry_run": not args.confirm,
+            "confirm": args.confirm,
+            "desired_file_count": 0,
+            "results": [
+                await zadig_build_template_delete(
+                    template_name=args.template,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            ],
+        }
+    if not args.file and not args.dir:
+        raise ValueError("--file or --dir is required for template apply")
+    if args.mode == "delete" and not args.template and not args.file:
+        raise ValueError("--template or --file is required for template delete mode")
+    if args.prune:
+        raise ValueError("template prune is intentionally unsupported; delete templates explicitly")
+
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    files = desired_build_template_files(target_path)
+    if not files:
+        raise ValueError(f"no build template YAML files found under {target_path}")
+
+    results = []
+    for template_file in files:
+        document = build_template_document_from_file(template_file)
+        template_name = build_template_name_from_document(document)
+        template_id = build_template_id_from_document(document)
+        if args.template and template_name != args.template and template_id != args.template:
+            continue
+        template_spec = build_template_spec_from_document(document)
+        if args.diff:
+            results.append(
+                await zadig_build_template_diff(
+                    template=template_spec,
+                    template_id=template_id,
+                    template_name=template_name,
+                )
+            )
+            continue
+        if args.mode == "delete":
+            results.append(
+                await zadig_build_template_delete(
+                    template_id=template_id,
+                    template_name=template_name,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+            continue
+        results.append(
+            await zadig_build_template_apply(
+                template=template_spec,
+                template_id=template_id,
+                template_name=template_name,
+                mode=args.mode,
+                dry_run=not args.confirm,
+                confirm=args.confirm,
+                allow_redacted=args.allow_redacted,
+            )
+        )
+
+    return {
+        "entity": "template",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "desired_file_count": len(files),
+        "results": results,
+    }
+
+
 async def run_apply_service(args: argparse.Namespace) -> dict[str, Any]:
     project = args.project
     if not args.file and not args.dir:
@@ -877,11 +1133,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.set_defaults(func=run_snapshot)
 
-    apply = subparsers.add_parser("apply", help="Apply Zadig workflow/service configuration, or plan project changes.")
+    snapshot_template = subparsers.add_parser("snapshot-template", help="Export build template library snapshot to files.")
+    snapshot_template.add_argument("--output", default="zadig-config", help="Output directory.")
+    snapshot_template.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output file format.")
+    snapshot_template.add_argument("--template", help="Build template name or id filter.")
+    snapshot_template.add_argument("--query", default="", help="Filter templates by text search against list items.")
+    snapshot_template.add_argument("--page-num", type=int, default=1, help="Template list page number.")
+    snapshot_template.add_argument("--page-size", type=int, default=500, help="Template list page size.")
+    snapshot_template.set_defaults(func=run_snapshot_template)
+
+    apply = subparsers.add_parser("apply", help="Apply Zadig workflow/service/build/template configuration, or plan project changes.")
     apply.add_argument(
         "entity",
         nargs="?",
-        choices=["workflow", "service", "project", "build"],
+        choices=["workflow", "service", "project", "build", "template"],
         default="workflow",
         help="Entity type to apply or plan.",
     )
@@ -889,8 +1154,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--workflow", help="Workflow name. Defaults to workflow_name/workflow_key/name from file.")
     apply.add_argument("--service", help="Service name filter for service apply.")
     apply.add_argument("--build", help="Build name filter for build apply/delete.")
+    apply.add_argument("--template", help="Build template name or id filter for template apply/delete.")
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
-    apply.add_argument("--dir", help="Directory containing service item YAML files, usually projects/<project>/services.")
+    apply.add_argument("--dir", help="Directory containing item YAML files, for example projects/<project>/services or templates/build-templates.")
     apply.add_argument("--mode", choices=["auto", "create", "update", "delete"], default="auto", help="Apply mode.")
     apply.add_argument("--prune", action="store_true", help="For service apply, delete live services missing from desired files.")
     apply.add_argument(

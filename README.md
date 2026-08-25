@@ -28,7 +28,11 @@ checked against the live `zadigx.shub.us` instance and Zadig
 - `zadig_build_template_list`: list/search build template store templates.
 - `zadig_build_template_get`: get one build template store template by id or exact name.
 - `zadig_build_template_reference`: list build configurations that reference one build template.
+- `zadig_build_template_create`: create one build template store template. Defaults to dry run and requires `confirm=true`.
 - `zadig_build_template_update`: update one build template store template. Defaults to dry run and requires `confirm=true`.
+- `zadig_build_template_delete`: delete one build template store template. Defaults to dry run and requires `confirm=true`.
+- `zadig_build_template_diff`: diff current build template detail against a desired payload.
+- `zadig_build_template_apply`: create or update one build template. Defaults to dry run and requires `confirm=true`.
 - `zadig_build_get`: get one build configuration detail.
 - `zadig_build_update`: update one build configuration. Defaults to dry run and requires `confirm=true`.
 - `zadig_build_update_from_template`: update a build created from a build template. Defaults to dry run and requires `confirm=true`.
@@ -122,6 +126,11 @@ that project, and those templates are written under `templates/` because Zadig
 template-library resources are shared resources rather than project-owned
 resources.
 
+Per-template files under `templates/build-templates/` are exported as
+`kind: BuildTemplate` documents. Their `spec` is the desired Zadig template
+payload; `metadata.id` keeps the live template ID when known, and `metadata.name`
+is used to resolve the template when the ID is absent.
+
 `_snapshot/errors.yaml` is not Zadig configuration. It records snapshot-time API
 failures or unsupported sections so GitOps reviewers can tell whether an export
 is complete.
@@ -152,6 +161,21 @@ uv run zadig-gitops snapshot \
   --section workflow_details \
   --section webhooks \
   --workflow fat-pipelines \
+  --output ./zadig-config
+```
+
+Export the shared build-template library independently from project snapshots:
+
+```bash
+uv run zadig-gitops snapshot-template \
+  --output ./zadig-config
+```
+
+Export one template by name or id:
+
+```bash
+uv run zadig-gitops snapshot-template \
+  --template fat-build \
   --output ./zadig-config
 ```
 
@@ -248,6 +272,36 @@ uv run zadig-gitops apply build \
   --prune \
   --confirm
 ```
+
+Apply build template desired state from `templates/build-templates`. This is
+dry-run unless `--confirm` is set.
+
+```bash
+uv run zadig-gitops apply template \
+  --project fat \
+  --file ./zadig-config/templates/build-templates/fat-build.<id>.yaml
+```
+
+Print only the template diff:
+
+```bash
+uv run zadig-gitops apply template \
+  --project fat \
+  --file ./zadig-config/templates/build-templates/fat-build.<id>.yaml \
+  --diff
+```
+
+Delete a build template explicitly by name or id:
+
+```bash
+uv run zadig-gitops apply template \
+  --project fat \
+  --template fat-build \
+  --mode delete
+```
+
+Template prune is intentionally unsupported because build templates are shared
+library resources. Delete templates one at a time after checking references.
 
 Plan project changes from `project.yaml`. Project apply is intentionally
 plan-only for now: create/update/delete modes only compare desired config with

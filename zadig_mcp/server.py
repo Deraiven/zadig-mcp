@@ -1892,6 +1892,186 @@ async def zadig_build_template_update(
     return {"applied": True, "template_id": resolved_id, "template_name": template_name, "result": result}
 
 
+def build_template_desired_payload(template: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: copy.deepcopy(value)
+        for key, value in template.items()
+        if key not in {"id", "_id", "update_by", "updateBy", "update_time", "updateTime"}
+    }
+
+
+async def build_template_exists(template_id: str = "", template_name: str = "") -> tuple[bool, str]:
+    try:
+        resolved_id = await resolve_build_template_id(template_id, template_name)
+        return True, resolved_id
+    except ValueError as exc:
+        if "not found" in str(exc):
+            return False, ""
+        raise
+    except ZadigAPIError as exc:
+        if "HTTP 404" in str(exc) or "no documents in result" in str(exc):
+            return False, ""
+        raise
+
+
+@mcp.tool()
+async def zadig_build_template_create(
+    template: dict[str, Any],
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create one build template store template. Defaults to dry_run=true and requires confirm=true."""
+    payload = build_template_desired_payload(dict(template))
+    template_name = first_present(payload, "name", "template_name", "templateName") or ""
+
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to create Zadig build template",
+            "template_name": template_name,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request("POST", "/api/aslan/template/build", json_body=payload)
+    return {"applied": True, "template_name": template_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_build_template_delete(
+    template_id: str = "",
+    template_name: str = "",
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete one build template store template. Defaults to dry_run=true and requires confirm=true."""
+    resolved_id = await resolve_build_template_id(template_id, template_name)
+    references = await client().request("GET", f"/api/aslan/template/build/{path_name(resolved_id)}/reference")
+    result: dict[str, Any] = {
+        "applied": False,
+        "dry_run": dry_run,
+        "template_id": resolved_id,
+        "template_name": template_name,
+        "references": redact_sensitive(references),
+    }
+    if dry_run or not confirm:
+        result["reason"] = "set dry_run=false and confirm=true to delete Zadig build template"
+        return result
+
+    delete_result = await client().request("DELETE", f"/api/aslan/template/build/{path_name(resolved_id)}")
+    result["applied"] = True
+    result["result"] = delete_result
+    return result
+
+
+@mcp.tool()
+async def zadig_build_template_diff(
+    template: dict[str, Any],
+    template_id: str = "",
+    template_name: str = "",
+) -> dict[str, Any]:
+    """Diff current Zadig build template detail against desired template payload."""
+    desired = build_template_desired_payload(dict(template))
+    desired_name = template_name or str(first_present(desired, "name", "template_name", "templateName") or "")
+    exists, resolved_id = await build_template_exists(template_id, desired_name)
+    if not exists:
+        return {
+            "template_id": resolved_id,
+            "template_name": desired_name,
+            "exists": False,
+            "changed": True,
+            "diff": unified_diff("", json_for_diff(desired), f"{desired_name}:current", f"{desired_name}:desired"),
+            "desired": redact_sensitive(desired),
+        }
+
+    current = await client().request("GET", f"/api/aslan/template/build/{path_name(resolved_id)}")
+    current_desired = build_template_desired_payload(current if isinstance(current, dict) else {})
+    diff = unified_diff(
+        json_for_diff(current_desired),
+        json_for_diff(desired),
+        f"{desired_name or resolved_id}:current",
+        f"{desired_name or resolved_id}:desired",
+    )
+    return {
+        "template_id": resolved_id,
+        "template_name": desired_name,
+        "exists": True,
+        "changed": bool(diff.strip()),
+        "diff": diff,
+    }
+
+
+@mcp.tool()
+async def zadig_build_template_apply(
+    template: dict[str, Any],
+    template_id: str = "",
+    template_name: str = "",
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create or update one build template. mode can be auto, create, or update. Defaults to dry_run=true."""
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+
+    payload = build_template_desired_payload(dict(template))
+    desired_name = template_name or str(first_present(payload, "name", "template_name", "templateName") or "")
+    exists, resolved_id = await build_template_exists(template_id, desired_name)
+    action = mode
+    if action == "auto":
+        action = "update" if exists else "create"
+    if action == "create" and exists:
+        raise ValueError(f"build template {desired_name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"build template {desired_name!r} does not exist; use mode='create' or mode='auto'")
+
+    diff_result = await zadig_build_template_diff(payload, resolved_id, desired_name) if exists else {
+        "diff": unified_diff("", json_for_diff(payload), f"{desired_name}:current", f"{desired_name}:desired")
+    }
+    diff_text = diff_result.get("diff", "")
+    if action == "update" and not diff_text.strip():
+        action = "none"
+
+    if dry_run or not confirm or action == "none":
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "build template exists and desired spec matches live state"
+            if action == "none"
+            else "set dry_run=false and confirm=true to apply Zadig build template",
+            "template_id": resolved_id,
+            "template_name": desired_name,
+            "exists": exists,
+            "action": action,
+            "diff": diff_text,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    if action == "create":
+        result = await client().request("POST", "/api/aslan/template/build", json_body=payload)
+    else:
+        result = await client().request(
+            "PUT",
+            f"/api/aslan/template/build/{path_name(resolved_id)}",
+            json_body=payload,
+        )
+    return {
+        "applied": True,
+        "template_id": resolved_id,
+        "template_name": desired_name,
+        "exists_before_apply": exists,
+        "action": action,
+        "diff": diff_text,
+        "result": result,
+    }
+
+
 @mcp.tool()
 async def zadig_build_get(
     build_name: str,
