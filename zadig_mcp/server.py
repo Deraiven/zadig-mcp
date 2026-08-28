@@ -1901,6 +1901,89 @@ async def build_exists(project: str, build_name: str) -> bool:
         raise
 
 
+def prepare_ui_build_update_payload(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(live)
+    field_map = {
+        "build_script": "scripts",
+        "scripts": "scripts",
+        "post_build": "post_build",
+        "outputs": "outputs",
+    }
+    for source_key, target_key in field_map.items():
+        if source_key in desired:
+            payload[target_key] = copy.deepcopy(desired[source_key])
+
+    advanced_settings = desired.get("advanced_settings")
+    if isinstance(advanced_settings, dict) and "timeout" in advanced_settings:
+        payload["timeout"] = copy.deepcopy(advanced_settings["timeout"])
+    if "timeout" in desired:
+        payload["timeout"] = copy.deepcopy(desired["timeout"])
+
+    payload.setdefault("name", desired.get("name") or live.get("name"))
+    payload.setdefault("product_name", desired.get("project_key") or live.get("product_name"))
+    return payload
+
+
+async def update_build_via_ui(project: str, build_name: str, desired: dict[str, Any]) -> dict[str, Any]:
+    live = await client().request(
+        "GET",
+        f"/api/aslan/build/build/{path_name(build_name)}",
+        params={"projectName": project},
+    )
+    if not isinstance(live, dict):
+        raise ZadigAPIError(f"GET UI build detail for {build_name!r} returned non-object payload")
+    payload = prepare_ui_build_update_payload(live, desired)
+    result = await client().request(
+        "PUT",
+        "/api/aslan/build/build",
+        params={"projectName": project},
+        json_body=payload,
+    )
+    return {
+        "api": "ui",
+        "preserved_live_fields": True,
+        "mapped_fields": [
+            key
+            for key in ("build_script", "scripts", "post_build", "outputs", "timeout", "advanced_settings")
+            if key in desired
+        ],
+        "result": result,
+    }
+
+
+async def update_build_with_api(
+    project: str,
+    build_name: str,
+    payload: dict[str, Any],
+    update_api: str,
+) -> dict[str, Any]:
+    if update_api not in {"auto", "openapi", "ui"}:
+        raise ValueError("update_api must be one of: auto, openapi, ui")
+    if update_api == "ui":
+        return await update_build_via_ui(project, build_name, payload)
+
+    try:
+        result = await client().request("PUT", "/openapi/build", project_key=project, json_body=payload)
+        return {"api": "openapi", "result": result}
+    except ZadigAPIError as exc:
+        if update_api == "openapi":
+            raise
+        error_text = str(exc)
+        fallback_markers = (
+            "codehost",
+            "code host",
+            "codehost_name",
+            "failed to find codehost",
+            "http 400",
+        )
+        if any(marker in error_text.lower() for marker in fallback_markers):
+            fallback = await update_build_via_ui(project, build_name, payload)
+            fallback["fallback_from"] = "openapi"
+            fallback["openapi_error"] = error_text
+            return fallback
+        raise
+
+
 def build_template_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         for key in ("build_templates", "buildTemplates", "templates", "items", "list", "data"):
@@ -2339,6 +2422,7 @@ async def zadig_build_update(
     build_name: str,
     build: dict[str, Any],
     project_key: str | None = None,
+    update_api: str = "auto",
     dry_run: bool = True,
     confirm: bool = False,
     allow_redacted: bool = False,
@@ -2354,18 +2438,14 @@ async def zadig_build_update(
             "reason": "set dry_run=false and confirm=true to update Zadig build",
             "project_key": project,
             "build_name": build_name,
+            "update_api": update_api,
             "redacted_placeholder_paths": redacted_placeholder_paths(payload),
             "payload": redact_sensitive(payload),
         }
 
     assert_no_redacted_placeholders(payload, allow_redacted)
-    result = await client().request(
-        "PUT",
-        "/openapi/build",
-        project_key=project,
-        json_body=payload,
-    )
-    return {"applied": True, "project_key": project, "build_name": build_name, "result": result}
+    result = await update_build_with_api(project, build_name, payload, update_api)
+    return {"applied": True, "project_key": project, "build_name": build_name, "update_api": update_api, "result": result}
 
 
 @mcp.tool()
@@ -2439,6 +2519,7 @@ async def zadig_build_apply(
     build: dict[str, Any],
     project_key: str | None = None,
     mode: str = "auto",
+    update_api: str = "auto",
     dry_run: bool = True,
     confirm: bool = False,
     allow_redacted: bool = False,
@@ -2474,6 +2555,7 @@ async def zadig_build_apply(
             "build_name": build_name,
             "exists": exists,
             "action": action,
+            "update_api": update_api,
             "diff": diff_text,
             "redacted_placeholder_paths": redacted_placeholder_paths(payload),
             "payload": redact_sensitive(payload),
@@ -2484,13 +2566,14 @@ async def zadig_build_apply(
         params = {"source": "template"} if payload.get("source") == "template" else None
         result = await client().request("POST", "/openapi/build", project_key=project, params=params, json_body=payload)
     else:
-        result = await client().request("PUT", "/openapi/build", project_key=project, json_body=payload)
+        result = await update_build_with_api(project, build_name, payload, update_api)
     return {
         "applied": True,
         "project_key": project,
         "build_name": build_name,
         "exists_before_apply": exists,
         "action": action,
+        "update_api": update_api,
         "diff": diff_text,
         "result": result,
     }

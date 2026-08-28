@@ -1184,7 +1184,6 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
     shared_template_dir = output_dir / "templates" / "build-templates"
-    shared_template_reference_dir = output_dir / "references" / "build-templates"
     snapshot_dir = project_dir / "_snapshot"
     write_data(snapshot_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
     write_data(snapshot_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
@@ -1252,14 +1251,6 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
         write_data(
             shared_template_dir / data_filename(f"{safe_name(str(template_name))}.{safe_name(str(template_id))}", output_format),
             build_template_gitops_document(str(template_id), str(template_name), detail),
-            output_format,
-        )
-
-    template_refs = snapshot.get("build_template_references", {})
-    if template_refs:
-        write_data(
-            shared_template_reference_dir / data_filename("index", output_format),
-            template_refs,
             output_format,
         )
 
@@ -1656,6 +1647,7 @@ async def run_apply_build(args: argparse.Namespace) -> dict[str, Any]:
                 build=build_spec,
                 project_key=project,
                 mode=args.mode,
+                update_api=args.build_update_api,
                 dry_run=not args.confirm,
                 confirm=args.confirm,
                 allow_redacted=args.allow_redacted,
@@ -2126,6 +2118,12 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
     apply.add_argument("--dir", help="Directory containing item YAML files, for example projects/<project>/services or templates/build-templates.")
     apply.add_argument("--mode", choices=["auto", "create", "update", "delete"], default="auto", help="Apply mode.")
+    apply.add_argument(
+        "--build-update-api",
+        choices=["auto", "openapi", "ui"],
+        default="auto",
+        help="For build update/apply, choose OpenAPI, UI-compatible API, or automatic fallback.",
+    )
     apply.add_argument("--prune", action="store_true", help="For service apply, delete live services missing from desired files.")
     apply.add_argument(
         "--production",

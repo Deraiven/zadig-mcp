@@ -131,9 +131,6 @@ zadig-config/
         Chart.yaml
         values.yaml
         templates/
-  references/
-    build-templates/
-      index.yaml
 ```
 
 Project snapshots only include build templates that are actually referenced by
@@ -319,6 +316,13 @@ uv run zadig-gitops apply build \
   --project bi \
   --file ./zadig-config/projects/bi/builds/items/bi-build.yaml
 ```
+
+Build update defaults to `--build-update-api auto`: it first tries Zadig's
+OpenAPI and falls back to the UI-compatible build API when the live instance
+requires UI-only fields such as `codehost_id`. The fallback loads the live build
+detail, preserves repository/codehost/target fields, and maps only supported
+desired fields such as `build_script`, `post_build`, `outputs`, and `timeout`.
+Use `--build-update-api ui` to force that path for known script-only updates.
 
 Apply all build files in a project:
 
