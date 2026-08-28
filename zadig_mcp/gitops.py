@@ -1183,7 +1183,6 @@ def split_workflow_assets(
 def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: str) -> None:
     project = snapshot.get("metadata", {}).get("project_key") or "unknown-project"
     project_dir = output_dir / "projects" / safe_name(str(project))
-    shared_template_dir = output_dir / "templates" / "build-templates"
     snapshot_dir = project_dir / "_snapshot"
     write_data(snapshot_dir / data_filename("metadata", output_format), snapshot.get("metadata", {}), output_format)
     write_data(snapshot_dir / data_filename("errors", output_format), snapshot.get("errors", []), output_format)
@@ -1232,27 +1231,6 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
 
     if "code_scans" in snapshot:
         write_data(project_dir / "code-scans" / data_filename("index", output_format), snapshot["code_scans"], output_format)
-
-    build_templates = snapshot.get("build_templates", {})
-    if build_templates:
-        write_data(
-            shared_template_dir / data_filename("index", output_format),
-            {
-                "count": build_templates.get("count", 0),
-                "scope": build_templates.get("scope"),
-                "project_key": build_templates.get("project_key"),
-                "summary": build_templates.get("summary", []),
-            },
-            output_format,
-        )
-    for template_id, item in build_templates.get("items", {}).items():
-        template_name = item.get("name") or template_id
-        detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
-        write_data(
-            shared_template_dir / data_filename(f"{safe_name(str(template_name))}.{safe_name(str(template_id))}", output_format),
-            build_template_gitops_document(str(template_id), str(template_name), detail),
-            output_format,
-        )
 
     if "services" in snapshot:
         services = snapshot["services"] if isinstance(snapshot["services"], dict) else {}

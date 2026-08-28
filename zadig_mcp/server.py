@@ -2,6 +2,7 @@ import copy
 import json
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -47,14 +48,20 @@ def summarize_workflows(payload: Any, query: str = "") -> list[dict[str, Any]]:
 
         name = (
             workflow.get("name")
+            or workflow.get("workflow_key")
+            or workflow.get("workflowKey")
             or workflow.get("display_name")
             or workflow.get("workflow_name")
             or workflow.get("workflowName")
             or workflow.get("id")
         )
+        workflow_key = workflow.get("workflow_key") or workflow.get("workflowKey")
+        workflow_name = workflow.get("workflow_name") or workflow.get("workflowName")
         summary = {
             "name": name,
-            "display_name": workflow.get("display_name") or workflow.get("displayName"),
+            "workflow_key": workflow_key,
+            "workflow_name": workflow_name,
+            "display_name": workflow.get("display_name") or workflow.get("displayName") or workflow_name,
             "workflow_type": workflow.get("workflow_type") or workflow.get("workflowType") or workflow.get("type"),
             "enabled": workflow.get("enabled"),
             "created_by": workflow.get("created_by") or workflow.get("createdBy"),
@@ -77,6 +84,14 @@ SENSITIVE_FIELD_NAMES = {
     "password",
     "secret",
     "private_key",
+    "database_url",
+    "database_uri",
+    "mongodb_url",
+    "mongodb_uri",
+    "redis_url",
+    "redis_uri",
+    "dsn",
+    "connection_string",
 }
 
 
@@ -104,8 +119,22 @@ def is_sensitive_key(key: str) -> bool:
     if lowered in {"is_credential", "iscredential"}:
         return False
     return lowered in SENSITIVE_FIELD_NAMES or any(
-        marker in lowered for marker in ("token", "secret", "password", "credential", "private")
+        marker in lowered
+        for marker in ("token", "secret", "password", "credential", "private", "database_url", "dsn")
     )
+
+
+def redact_url_userinfo(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.scheme or not parsed.netloc or "@" not in parsed.netloc:
+        return value
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, f"***redacted***@{host}", parsed.path, parsed.query, parsed.fragment))
 
 
 def redact_sensitive(value: Any, parent_key: str = "") -> Any:
@@ -116,7 +145,7 @@ def redact_sensitive(value: Any, parent_key: str = "") -> Any:
         value_name = first_present(value, "key", "name", "variable_name", "variableName", "env_name", "envName")
         value_is_sensitive = isinstance(value_name, str) and is_sensitive_key(value_name)
         for key, item in value.items():
-            if key == "value" and (is_credential or value_is_sensitive):
+            if key in {"value", "default", "choice_option", "choiceOption"} and (is_credential or value_is_sensitive):
                 redacted[key] = "***redacted***"
             elif is_sensitive_key(str(key)):
                 redacted[key] = "***redacted***"
@@ -127,6 +156,8 @@ def redact_sensitive(value: Any, parent_key: str = "") -> Any:
         return [redact_sensitive(item, parent_key) for item in value]
     if is_sensitive_key(parent_key) and value not in (None, ""):
         return "***redacted***"
+    if isinstance(value, str):
+        return redact_url_userinfo(value)
     return value
 
 
