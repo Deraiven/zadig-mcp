@@ -500,6 +500,44 @@ def payload_items(payload: Any) -> list[Any]:
     return []
 
 
+def test_name_from_payload(test: dict[str, Any]) -> str:
+    metadata = test.get("metadata") if isinstance(test.get("metadata"), dict) else {}
+    spec = test.get("spec") if isinstance(test.get("spec"), dict) else {}
+    name = metadata.get("name") or spec.get("name") or test.get("name") or test.get("test_name")
+    if not name:
+        raise ValueError("test document must contain metadata.name or spec.name")
+    return str(name)
+
+
+def test_desired_payload(test: dict[str, Any], project: str) -> dict[str, Any]:
+    """Convert a Test GitOps document to Zadig's internal test config payload."""
+    spec = test.get("spec") if isinstance(test.get("spec"), dict) else None
+    payload = copy.deepcopy(spec if spec is not None else test)
+    payload.pop("metadata", None)
+    payload.pop("apiVersion", None)
+    payload.pop("kind", None)
+    payload.pop("live", None)
+    for key in ("id", "update_time", "updateTime", "created_at", "createdAt", "updated_at", "updatedAt", "update_by", "updated_by"):
+        payload.pop(key, None)
+    payload["name"] = test_name_from_payload(test)
+    payload.setdefault("product_name", project)
+    return payload
+
+
+async def test_lookup(project: str, name: str) -> tuple[bool, dict[str, Any] | None]:
+    try:
+        payload = await client().request(
+            "GET",
+            f"/api/aslan/testing/test/{path_name(name)}",
+            params={"projectName": project},
+        )
+        return True, payload if isinstance(payload, dict) else {}
+    except ZadigAPIError as exc:
+        if "HTTP 404" in str(exc) or "no documents in result" in str(exc):
+            return False, None
+        raise
+
+
 def project_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         for key in ("projects", "items", "list", "data"):
@@ -1424,9 +1462,26 @@ async def zadig_project_snapshot(
                 params={"projectName": project},
             )
             test_items = payload_items(test_payload)
+            test_details: dict[str, Any] = {}
+            for item in test_items:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or item.get("test_name")
+                if not name:
+                    continue
+                try:
+                    detail = await client().request(
+                        "GET",
+                        f"/api/aslan/testing/test/{path_name(str(name))}",
+                        params={"projectName": project},
+                    )
+                    test_details[str(name)] = redact_sensitive(detail)
+                except Exception as exc:
+                    snapshot["errors"].append({"section": "test_details", "test_name": str(name), **error_summary(exc)})
             snapshot["tests"] = {
                 "count": len(test_items),
                 "items": redact_sensitive(test_items),
+                "details": test_details,
                 "raw": redact_sensitive(test_payload),
             }
         except Exception as exc:
@@ -1677,6 +1732,223 @@ async def zadig_project_snapshot(
 
     snapshot["metadata"]["error_count"] = len(snapshot["errors"])
     return snapshot
+
+
+@mcp.tool()
+async def zadig_test_list(
+    project_key: str | None = None,
+    query: str = "",
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """List Zadig test configurations from the internal configuration API."""
+    project = default_project(project_key)
+    payload = await client().request("GET", "/api/aslan/testing/testdetail", params={"projectName": project})
+    items = [item for item in payload_items(payload) if isinstance(item, dict)]
+    needle = query.strip().lower()
+    if needle:
+        items = [item for item in items if needle in json.dumps(item, ensure_ascii=False).lower()]
+    result: dict[str, Any] = {
+        "project_key": project,
+        "count": len(items),
+        "items": redact_sensitive(items),
+        "source": "internal:/api/aslan/testing/testdetail",
+    }
+    if include_raw:
+        result["raw"] = redact_sensitive(payload)
+    return result
+
+
+@mcp.tool()
+async def zadig_test_get(
+    test_name: str,
+    project_key: str | None = None,
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """Get one Zadig test configuration."""
+    project = default_project(project_key)
+    exists, payload = await test_lookup(project, test_name)
+    if not exists:
+        return {"project_key": project, "test_name": test_name, "exists": False}
+    result: dict[str, Any] = {
+        "project_key": project,
+        "test_name": test_name,
+        "exists": True,
+        "test": redact_sensitive(payload),
+        "source": "internal:/api/aslan/testing/test/{testName}",
+    }
+    if include_raw:
+        result["raw"] = redact_sensitive(payload)
+    return result
+
+
+@mcp.tool()
+async def zadig_test_create(
+    test: dict[str, Any],
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create one Zadig test configuration. Defaults to dry_run=true."""
+    project = default_project(project_key)
+    payload = test_desired_payload(test, project)
+    exists, _ = await test_lookup(project, str(payload["name"]))
+    if exists:
+        raise ValueError(f"test {payload['name']!r} already exists; use update or apply mode=auto")
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to create Zadig test",
+            "project_key": project,
+            "test_name": payload["name"],
+            "payload": redact_sensitive(payload),
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+        }
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request(
+        "POST",
+        "/api/aslan/testing/test",
+        params={"projectName": project},
+        json_body=payload,
+    )
+    return {"applied": True, "project_key": project, "test_name": payload["name"], "result": result}
+
+
+@mcp.tool()
+async def zadig_test_update(
+    test: dict[str, Any],
+    test_name: str = "",
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Update one Zadig test configuration. Defaults to dry_run=true."""
+    project = default_project(project_key)
+    name = test_name or test_name_from_payload(test)
+    payload = test_desired_payload(test, project)
+    payload["name"] = name
+    exists, _ = await test_lookup(project, name)
+    if not exists:
+        raise ValueError(f"test {name!r} does not exist; use create or apply mode=auto")
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to update Zadig test",
+            "project_key": project,
+            "test_name": name,
+            "payload": redact_sensitive(payload),
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+        }
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request(
+        "PUT",
+        "/api/aslan/testing/test",
+        params={"projectName": project},
+        json_body=payload,
+    )
+    return {"applied": True, "project_key": project, "test_name": name, "result": result}
+
+
+@mcp.tool()
+async def zadig_test_delete(
+    test_name: str,
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete one Zadig test configuration. Defaults to dry_run=true."""
+    project = default_project(project_key)
+    exists, _ = await test_lookup(project, test_name)
+    if not exists:
+        return {"applied": False, "dry_run": dry_run, "project_key": project, "test_name": test_name, "action": "none"}
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to delete Zadig test",
+            "project_key": project,
+            "test_name": test_name,
+        }
+    result = await client().request(
+        "DELETE",
+        f"/api/aslan/testing/test/{path_name(test_name)}",
+        params={"projectName": project},
+    )
+    return {"applied": True, "project_key": project, "test_name": test_name, "result": result}
+
+
+@mcp.tool()
+async def zadig_test_diff(
+    test: dict[str, Any],
+    test_name: str = "",
+    project_key: str | None = None,
+) -> dict[str, Any]:
+    """Diff a desired Test document against the live Zadig test configuration."""
+    project = default_project(project_key)
+    name = test_name or test_name_from_payload(test)
+    desired = test_desired_payload(test, project)
+    exists, live = await test_lookup(project, name)
+    if not exists:
+        diff = unified_diff("", json_for_diff(redact_sensitive(desired)), f"{name}:current", f"{name}:desired")
+        return {"project_key": project, "test_name": name, "exists": False, "changed": True, "diff": diff}
+    current = (
+        test_desired_payload({"metadata": {"name": name}, "spec": live}, project)
+        if isinstance(live, dict)
+        else {}
+    )
+    diff = unified_diff(
+        json_for_diff(redact_sensitive(current)),
+        json_for_diff(redact_sensitive(desired)),
+        f"{name}:current",
+        f"{name}:desired",
+    )
+    return {"project_key": project, "test_name": name, "exists": True, "changed": bool(diff.strip()), "diff": diff}
+
+
+@mcp.tool()
+async def zadig_test_apply(
+    test: dict[str, Any],
+    test_name: str = "",
+    project_key: str | None = None,
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create or update one Zadig test. mode can be auto, create, or update."""
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+    project = default_project(project_key)
+    name = test_name or test_name_from_payload(test)
+    exists, _ = await test_lookup(project, name)
+    action = "update" if mode == "auto" and exists else "create" if mode == "auto" else mode
+    if action == "create" and exists:
+        raise ValueError(f"test {name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"test {name!r} does not exist; use mode='create' or mode='auto'")
+    diff = await zadig_test_diff(test, name, project)
+    if action == "update" and not diff.get("changed"):
+        return {"applied": False, "dry_run": dry_run, "project_key": project, "test_name": name, "action": "none", "diff": ""}
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to apply Zadig test",
+            "project_key": project,
+            "test_name": name,
+            "action": action,
+            "diff": diff.get("diff", ""),
+        }
+    if action == "create":
+        result = await zadig_test_create(test, project, False, True, allow_redacted)
+    else:
+        result = await zadig_test_update(test, name, project, False, True, allow_redacted)
+    result["action"] = action
+    result["diff"] = diff.get("diff", "")
+    return result
 
 
 def code_scan_desired_payload(scan: dict[str, Any], project: str) -> dict[str, Any]:

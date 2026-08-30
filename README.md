@@ -21,6 +21,9 @@ checked against the live `zadigx.shub.us` instance and Zadig
 - `zadig_workflow_task_list`: list workflow tasks with deployment summaries.
 - `zadig_workflow_task_detail`: get one workflow task detail with deployment summaries.
 - `zadig_workflow_task_job_log`: get one workflow task job log, with tail and keyword filtering.
+- `zadig_test_list` / `zadig_test_get`: list or inspect test configurations, including full detail fields with sensitive values redacted.
+- `zadig_test_create` / `zadig_test_update` / `zadig_test_delete`: manage test configurations through Zadig's internal testing API, dry-run by default.
+- `zadig_test_diff` / `zadig_test_apply`: compare or create/update a test configuration with explicit confirmation for writes.
 - `zadig_workflow_webhook_list`: list saved webhook/git trigger settings for a workflow.
 - `zadig_workflow_webhook_preset`: get current webhook/git trigger preset for a workflow.
 - `zadig_workflow_webhook_compare_to_preset`: compare saved webhook/git trigger settings with the current preset.
@@ -455,6 +458,25 @@ uv run zadig-gitops apply environment-service \
   --environment fat \
   --service csp-v1-web-fe \
   --mode delete
+```
+
+Apply test configurations from `projects/<project>/tests/items`. The test
+configuration API is an internal Zadig endpoint, so keep the snapshot and
+apply version aligned with the deployed Zadig release. Writes are dry-run by
+default and require `--confirm`.
+
+```bash
+uv run zadig-gitops apply test \
+  --project mobile \
+  --dir ./zadig-config/projects/mobile/tests \
+  --diff
+```
+
+```bash
+uv run zadig-gitops apply test \
+  --project mobile \
+  --dir ./zadig-config/projects/mobile/tests \
+  --confirm
 ```
 
 Plan project changes from `project.yaml`. Project apply is intentionally

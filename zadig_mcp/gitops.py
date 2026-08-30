@@ -21,6 +21,11 @@ from .server import (
     zadig_code_scan_apply,
     zadig_code_scan_delete,
     zadig_code_scan_diff,
+    test_desired_payload,
+    test_name_from_payload,
+    zadig_test_apply,
+    zadig_test_delete,
+    zadig_test_diff,
     environment_service_gitops_document,
     environment_service_index_item,
     first_present,
@@ -629,6 +634,22 @@ def desired_code_scan_files(path: Path) -> list[Path]:
         return [path]
     items_dir = path / "items" if (path / "items").is_dir() else path
     return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
+def desired_test_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
+def test_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"test file {path} must contain a mapping")
+    if data.get("kind") not in {None, "Test"}:
+        raise ValueError(f"test file {path} must have kind: Test")
+    return data
 
 
 def code_scan_document_from_file(path: Path) -> dict[str, Any]:
@@ -1285,7 +1306,35 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
             )
 
     if "tests" in snapshot:
-        write_data(project_dir / "tests" / data_filename("index", output_format), snapshot["tests"], output_format)
+        tests = snapshot["tests"] if isinstance(snapshot["tests"], dict) else {}
+        test_items = tests.get("items") if isinstance(tests.get("items"), list) else []
+        test_details = tests.get("details") if isinstance(tests.get("details"), dict) else {}
+        if test_details:
+            test_items = [item for item in test_details.values() if isinstance(item, dict)]
+        index_items = []
+        for item in test_items:
+            if not isinstance(item, dict):
+                continue
+            name = test_name_from_payload(item)
+            document = {
+                "apiVersion": "zadig.storehub.io/v1alpha1",
+                "kind": "Test",
+                "metadata": {"project": str(project), "name": name},
+                "spec": copy.deepcopy(item),
+            }
+            document["spec"].pop("live", None)
+            index_items.append({
+                "name": name,
+                "file": f"items/{data_filename(safe_name(name), output_format)}",
+                "repository_count": len(item.get("repos") or item.get("repositories") or []),
+                "environment_count": len(item.get("envs") or item.get("environments") or []),
+            })
+            write_data(project_dir / "tests" / "items" / data_filename(safe_name(name), output_format), document, output_format)
+        write_data(
+            project_dir / "tests" / data_filename("index", output_format),
+            {"apiVersion": "zadig.storehub.io/v1alpha1", "kind": "TestIndex", "project": str(project), "count": len(index_items), "items": sorted(index_items, key=lambda item: str(item["name"]))},
+            output_format,
+        )
 
     if "code_scans" in snapshot:
         code_scans = snapshot["code_scans"] if isinstance(snapshot["code_scans"], dict) else {}
@@ -1553,6 +1602,11 @@ async def run_apply(args: argparse.Namespace) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
+    if args.entity == "test":
+        result = await run_apply_test(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
     if args.entity == "service":
         result = await run_apply_service(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1701,6 +1755,46 @@ async def run_apply_code_scan(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "project_key": project,
         "entity": "code-scan",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "target_path": str(target_path),
+        "desired_file_count": len(files),
+        "results": results,
+    }
+
+
+async def run_apply_test(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.file and not args.dir:
+        raise ValueError("--file or --dir is required for test apply")
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    files = desired_test_files(target_path)
+    if not files and args.mode != "delete":
+        raise ValueError(f"no test YAML files found under {target_path}")
+    results = []
+    for test_file in files:
+        document = test_document_from_file(test_file)
+        name = args.test or test_name_from_payload(document)
+        if args.test and name != args.test:
+            continue
+        if args.diff:
+            results.append(await zadig_test_diff(document, name, args.project))
+        elif args.mode == "delete":
+            results.append(await zadig_test_delete(name, args.project, not args.confirm, args.confirm))
+        else:
+            results.append(await zadig_test_apply(
+                document,
+                name,
+                args.project,
+                args.mode,
+                not args.confirm,
+                args.confirm,
+                args.allow_redacted,
+            ))
+    if args.test and not results:
+        raise ValueError(f"no matching test file found under {target_path}")
+    return {
+        "project_key": args.project,
+        "entity": "test",
         "dry_run": not args.confirm,
         "confirm": args.confirm,
         "target_path": str(target_path),
@@ -2255,7 +2349,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "entity",
         nargs="?",
-        choices=["workflow", "service", "project", "build", "template", "environment", "environment-service", "code-scan"],
+        choices=["workflow", "service", "project", "build", "template", "environment", "environment-service", "code-scan", "test"],
         default="workflow",
         help="Entity type to apply or plan.",
     )
@@ -2265,6 +2359,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--build", help="Build name filter for build apply/delete.")
     apply.add_argument("--template", help="Build template name or id filter for template apply/delete.")
     apply.add_argument("--code-scan", help="Code scan name filter for code-scan apply/delete.")
+    apply.add_argument("--test", help="Test name filter for test apply/delete.")
     apply.add_argument("--environment", help="Environment name/key filter for environment apply/delete.")
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
     apply.add_argument("--dir", help="Directory containing item YAML files, for example projects/<project>/services or templates/build-templates.")
