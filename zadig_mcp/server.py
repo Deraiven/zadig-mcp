@@ -961,6 +961,24 @@ def assert_no_redacted_placeholders(value: Any, allow_redacted: bool = False) ->
         )
 
 
+def restore_redacted_placeholders(desired: Any, current: Any) -> Any:
+    """Restore live values for redacted fields before an update payload is sent."""
+    if desired == "***redacted***":
+        return copy.deepcopy(current)
+    if isinstance(desired, dict) and isinstance(current, dict):
+        restored = copy.deepcopy(desired)
+        for key, value in desired.items():
+            if key in current:
+                restored[key] = restore_redacted_placeholders(value, current[key])
+        return restored
+    if isinstance(desired, list) and isinstance(current, list):
+        return [
+            restore_redacted_placeholders(value, current[index]) if index < len(current) else value
+            for index, value in enumerate(desired)
+        ]
+    return desired
+
+
 async def workflow_exists(project: str, workflow_name: str) -> bool:
     try:
         await client().request(
@@ -1422,9 +1440,29 @@ async def zadig_project_snapshot(
                 params={"projectName": project},
             )
             scan_items = payload_items(scan_payload)
+            scan_details: list[dict[str, Any]] = []
+            for scan_item in scan_items:
+                if not isinstance(scan_item, dict):
+                    continue
+                scan_id = first_present(scan_item, "id", "scan_id", "scanId")
+                if scan_id in (None, ""):
+                    scan_details.append(redact_sensitive(scan_item))
+                    continue
+                try:
+                    detail_payload = await client().request(
+                        "GET",
+                        f"/api/aslan/testing/scanning/{path_name(str(scan_id))}",
+                        params={"projectName": project},
+                    )
+                    scan_details.append(redact_sensitive(detail_payload))
+                except Exception as exc:
+                    snapshot["errors"].append(
+                        {"section": "code_scan_details", "scan_id": str(scan_id), **error_summary(exc)}
+                    )
+                    scan_details.append(redact_sensitive(scan_item))
             snapshot["code_scans"] = {
-                "count": len(scan_items),
-                "items": redact_sensitive(scan_items),
+                "count": len(scan_details),
+                "items": scan_details,
                 "raw": redact_sensitive(scan_payload),
             }
         except Exception as exc:
@@ -1639,6 +1677,315 @@ async def zadig_project_snapshot(
 
     snapshot["metadata"]["error_count"] = len(snapshot["errors"])
     return snapshot
+
+
+def code_scan_desired_payload(scan: dict[str, Any], project: str) -> dict[str, Any]:
+    document = scan if isinstance(scan, dict) else {}
+    spec = document.get("spec") if isinstance(document.get("spec"), dict) else document
+    payload = copy.deepcopy(spec)
+    payload.pop("id", None)
+    payload.pop("scan_id", None)
+    payload.pop("scanId", None)
+    payload.pop("created_at", None)
+    payload.pop("createdAt", None)
+    payload.pop("updated_at", None)
+    payload.pop("updatedAt", None)
+    payload.pop("statistics", None)
+    payload.pop("live", None)
+    payload.setdefault("project_name", project)
+    payload.setdefault("project_key", project)
+    if not payload.get("name"):
+        metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+        if metadata.get("name"):
+            payload["name"] = metadata["name"]
+    return payload
+
+
+def code_scan_name_from_payload(scan: dict[str, Any]) -> str:
+    metadata = scan.get("metadata") if isinstance(scan.get("metadata"), dict) else {}
+    spec = scan.get("spec") if isinstance(scan.get("spec"), dict) else scan
+    return str(first_present(metadata, "name") or first_present(spec, "name", "scan_name", "scanName") or "")
+
+
+async def code_scan_lookup(project: str, scan_name: str) -> tuple[bool, str]:
+    payload = await client().request(
+        "GET",
+        "/api/aslan/testing/scanning",
+        params={"projectName": project},
+    )
+    for item in payload_items(payload):
+        if not isinstance(item, dict):
+            continue
+        name = first_present(item, "name", "scan_name", "scanName")
+        if str(name or "") == scan_name:
+            scan_id = first_present(item, "id", "scan_id", "scanId")
+            if scan_id in (None, ""):
+                raise ValueError(f"code scan {scan_name!r} has no id")
+            return True, str(scan_id)
+    return False, ""
+
+
+@mcp.tool()
+async def zadig_code_scan_list(
+    project_key: str | None = None,
+    query: str = "",
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """List Zadig code scan configurations."""
+    project = default_project(project_key)
+    payload = await client().request(
+        "GET",
+        "/api/aslan/testing/scanning",
+        params={"projectName": project},
+    )
+    items = [item for item in payload_items(payload) if isinstance(item, dict)]
+    needle = query.strip().lower()
+    if needle:
+        items = [item for item in items if needle in json.dumps(item, ensure_ascii=False).lower()]
+    result: dict[str, Any] = {
+        "project_key": project,
+        "count": len(items),
+        "items": redact_sensitive(items),
+    }
+    if include_raw:
+        result["raw"] = redact_sensitive(payload)
+    return result
+
+
+@mcp.tool()
+async def zadig_code_scan_get(
+    scan_name: str = "",
+    scan_id: str = "",
+    project_key: str | None = None,
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """Get one Zadig code scan configuration by name or ID."""
+    project = default_project(project_key)
+    resolved_id = scan_id
+    if not resolved_id:
+        if not scan_name:
+            raise ValueError("scan_name or scan_id is required")
+        exists, resolved_id = await code_scan_lookup(project, scan_name)
+        if not exists:
+            return {"project_key": project, "scan_name": scan_name, "exists": False}
+    payload = await client().request(
+        "GET",
+        f"/api/aslan/testing/scanning/{path_name(resolved_id)}",
+        params={"projectName": project},
+    )
+    result: dict[str, Any] = {
+        "project_key": project,
+        "scan_id": resolved_id,
+        "scan_name": scan_name or code_scan_name_from_payload(payload if isinstance(payload, dict) else {}),
+        "exists": True,
+        "scan": redact_sensitive(payload),
+    }
+    if include_raw:
+        result["raw"] = redact_sensitive(payload)
+    return result
+
+
+@mcp.tool()
+async def zadig_code_scan_create(
+    scan: dict[str, Any],
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create one code scan. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    payload = code_scan_desired_payload(scan, project)
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to create Zadig code scan",
+            "project_key": project,
+            "scan_name": code_scan_name_from_payload(scan),
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request(
+        "POST",
+        "/api/aslan/testing/scanning",
+        params={"projectName": project},
+        json_body=payload,
+    )
+    return {"applied": True, "project_key": project, "scan_name": payload.get("name", ""), "result": result}
+
+
+@mcp.tool()
+async def zadig_code_scan_update(
+    scan: dict[str, Any],
+    scan_name: str = "",
+    scan_id: str = "",
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Update one code scan. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    name = scan_name or code_scan_name_from_payload(scan)
+    resolved_id = scan_id
+    if not resolved_id:
+        exists, resolved_id = await code_scan_lookup(project, name)
+        if not exists:
+            raise ValueError(f"code scan {name!r} does not exist")
+    payload = code_scan_desired_payload(scan, project)
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to update Zadig code scan",
+            "project_key": project,
+            "scan_name": name,
+            "scan_id": resolved_id,
+            "redacted_placeholder_paths": redacted_placeholder_paths(payload),
+            "payload": redact_sensitive(payload),
+        }
+    assert_no_redacted_placeholders(payload, allow_redacted)
+    result = await client().request(
+        "PUT",
+        f"/api/aslan/testing/scanning/{path_name(resolved_id)}",
+        params={"projectName": project},
+        json_body=payload,
+    )
+    return {"applied": True, "project_key": project, "scan_name": name, "scan_id": resolved_id, "result": result}
+
+
+@mcp.tool()
+async def zadig_code_scan_delete(
+    scan_name: str = "",
+    scan_id: str = "",
+    project_key: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete one code scan. Defaults to dry_run=true and requires confirm=true."""
+    project = default_project(project_key)
+    resolved_id = scan_id
+    if not resolved_id:
+        if not scan_name:
+            raise ValueError("scan_name or scan_id is required")
+        exists, resolved_id = await code_scan_lookup(project, scan_name)
+        if not exists:
+            return {"applied": False, "dry_run": dry_run, "project_key": project, "scan_name": scan_name, "action": "none"}
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "reason": "set dry_run=false and confirm=true to delete Zadig code scan",
+            "project_key": project,
+            "scan_name": scan_name,
+            "scan_id": resolved_id,
+        }
+    result = await client().request(
+        "DELETE",
+        f"/api/aslan/testing/scanning/{path_name(resolved_id)}",
+        params={"projectName": project},
+    )
+    return {"applied": True, "project_key": project, "scan_name": scan_name, "scan_id": resolved_id, "result": result}
+
+
+@mcp.tool()
+async def zadig_code_scan_diff(
+    scan: dict[str, Any],
+    scan_name: str = "",
+    scan_id: str = "",
+    project_key: str | None = None,
+) -> dict[str, Any]:
+    """Diff current Zadig code scan configuration against a desired document."""
+    project = default_project(project_key)
+    name = scan_name or code_scan_name_from_payload(scan)
+    desired = code_scan_desired_payload(scan, project)
+    exists, resolved_id = await code_scan_lookup(project, name)
+    if not exists and scan_id:
+        resolved_id = scan_id
+        exists = True
+    if not exists:
+        return {
+            "project_key": project,
+            "scan_name": name,
+            "exists": False,
+            "changed": True,
+            "diff": unified_diff("", json_for_diff(desired), f"{name}:current", f"{name}:desired"),
+            "desired": redact_sensitive(desired),
+        }
+    current_payload = await client().request(
+        "GET",
+        f"/api/aslan/testing/scanning/{path_name(resolved_id)}",
+        params={"projectName": project},
+    )
+    current = code_scan_desired_payload(current_payload if isinstance(current_payload, dict) else {}, project)
+    diff = unified_diff(json_for_diff(current), json_for_diff(desired), f"{name}:current", f"{name}:desired")
+    return {
+        "project_key": project,
+        "scan_name": name,
+        "scan_id": resolved_id,
+        "exists": True,
+        "changed": bool(diff.strip()),
+        "diff": diff,
+    }
+
+
+@mcp.tool()
+async def zadig_code_scan_apply(
+    scan: dict[str, Any],
+    scan_name: str = "",
+    project_key: str | None = None,
+    mode: str = "auto",
+    dry_run: bool = True,
+    confirm: bool = False,
+    allow_redacted: bool = False,
+) -> dict[str, Any]:
+    """Create or update one code scan. mode can be auto, create, or update."""
+    if mode not in {"auto", "create", "update"}:
+        raise ValueError("mode must be one of: auto, create, update")
+    project = default_project(project_key)
+    name = scan_name or code_scan_name_from_payload(scan)
+    if not name:
+        raise ValueError("code scan document must contain metadata.name or spec.name")
+    exists, resolved_id = await code_scan_lookup(project, name)
+    action = "update" if mode == "auto" and exists else "create" if mode == "auto" else mode
+    if action == "create" and exists:
+        raise ValueError(f"code scan {name!r} already exists; use mode='update' or mode='auto'")
+    if action == "update" and not exists:
+        raise ValueError(f"code scan {name!r} does not exist; use mode='create' or mode='auto'")
+    diff = await zadig_code_scan_diff(scan, name, resolved_id, project)
+    if action == "update" and not diff.get("changed"):
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "project_key": project,
+            "scan_name": name,
+            "scan_id": resolved_id,
+            "action": "none",
+            "reason": "code scan exists and desired spec matches live state",
+            "diff": "",
+        }
+    if dry_run or not confirm:
+        return {
+            "applied": False,
+            "dry_run": dry_run,
+            "project_key": project,
+            "scan_name": name,
+            "scan_id": resolved_id,
+            "exists": exists,
+            "action": action,
+            "reason": "set dry_run=false and confirm=true to apply Zadig code scan",
+            "diff": diff.get("diff", ""),
+            "redacted_placeholder_paths": redacted_placeholder_paths(code_scan_desired_payload(scan, project)),
+        }
+    if action == "create":
+        result = await zadig_code_scan_create(scan, project, False, True, allow_redacted)
+    else:
+        result = await zadig_code_scan_update(scan, name, resolved_id, project, False, True, allow_redacted)
+    result["action"] = action
+    result["diff"] = diff.get("diff", "")
+    return result
 
 
 @mcp.tool()
@@ -2347,6 +2694,13 @@ async def zadig_build_template_apply(
         raise ValueError(f"build template {desired_name!r} already exists; use mode='update' or mode='auto'")
     if action == "update" and not exists:
         raise ValueError(f"build template {desired_name!r} does not exist; use mode='create' or mode='auto'")
+
+    if exists and action == "update":
+        current_payload = await client().request(
+            "GET",
+            f"/api/aslan/template/build/{path_name(resolved_id)}",
+        )
+        payload = restore_redacted_placeholders(payload, current_payload)
 
     diff_result = await zadig_build_template_diff(payload, resolved_id, desired_name) if exists else {
         "diff": unified_diff("", json_for_diff(payload), f"{desired_name}:current", f"{desired_name}:desired")

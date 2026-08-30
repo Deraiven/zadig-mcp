@@ -52,6 +52,13 @@ checked against the live `zadigx.shub.us` instance and Zadig
 - `zadig_environment_service_get`: get service detail in an environment.
 - `zadig_environment_service_apply`: add or update one environment service. Defaults to dry run and requires `confirm=true`.
 - `zadig_environment_service_delete`: delete one environment service. Defaults to dry run and requires `confirm=true`.
+- `zadig_code_scan_list`: list/search project code scan configurations.
+- `zadig_code_scan_get`: get one code scan by name or ID.
+- `zadig_code_scan_create`: create one code scan. Defaults to dry run and requires `confirm=true`.
+- `zadig_code_scan_update`: update one code scan. Defaults to dry run and requires `confirm=true`.
+- `zadig_code_scan_delete`: delete one code scan. Defaults to dry run and requires `confirm=true`.
+- `zadig_code_scan_diff`: diff a code scan against the live Zadig configuration.
+- `zadig_code_scan_apply`: create or update one code scan. Defaults to dry run and requires `confirm=true`.
 
 ## Config
 
@@ -118,6 +125,7 @@ zadig-config/
     builds/scripts/<script>.meta.yaml
     tests/index.yaml
     code-scans/index.yaml
+    code-scans/items/<scan>.yaml
     services/index.yaml
     services/items/<service>.yaml
     environments/index.yaml
@@ -171,6 +179,31 @@ checking the optional SHA-256 checksum.
 `project.yaml` is the top-level project document exported from live Zadig
 project metadata. It is currently read-only snapshot data plus a small
 GitOps-oriented `spec`.
+
+`code-scans/index.yaml` is an inventory only. Each scan configuration is stored
+under `code-scans/items/<scan>.yaml` as a `kind: CodeScan` document. The
+configuration is under `spec`; server-generated IDs, timestamps, and runtime
+statistics are retained under `live` and are excluded from the desired state.
+
+The GitOps CLI supports code scan CRUD with the same dry-run-first behavior as
+other project resources:
+
+```bash
+zadig-gitops apply code-scan \
+  --project mobile \
+  --dir ./zadig-config/projects/mobile/code-scans
+
+zadig-gitops apply code-scan \
+  --project mobile \
+  --code-scan sonarqube-test \
+  --diff
+
+zadig-gitops apply code-scan \
+  --project mobile \
+  --code-scan sonarqube-test \
+  --mode delete \
+  --confirm
+```
 
 Workflow snapshots are split for reviewability:
 

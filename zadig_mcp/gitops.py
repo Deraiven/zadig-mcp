@@ -17,6 +17,10 @@ from .server import (
     build_template_desired_payload,
     build_template_items_from_payload,
     client,
+    code_scan_name_from_payload,
+    zadig_code_scan_apply,
+    zadig_code_scan_delete,
+    zadig_code_scan_diff,
     environment_service_gitops_document,
     environment_service_index_item,
     first_present,
@@ -86,6 +90,44 @@ def write_data(path: Path, value: Any, output_format: str) -> None:
 def data_filename(name: str, output_format: str) -> str:
     suffix = "json" if output_format == "json" else "yaml"
     return f"{name}.{suffix}"
+
+
+def code_scan_name(item: dict[str, Any], index: int) -> str:
+    name = first_present(item, "name", "scan_name", "scanName", "code_scan_name", "codeScanName")
+    if name not in (None, ""):
+        return str(name)
+    identifier = first_present(item, "id", "scan_id", "scanId")
+    if identifier not in (None, ""):
+        return str(identifier)
+    return f"unnamed-{index}"
+
+
+def code_scan_gitops_document(project: str, item: dict[str, Any], index: int) -> dict[str, Any]:
+    """Keep scan configuration separate from server-generated runtime metadata."""
+    name = code_scan_name(item, index)
+    runtime_keys = {
+        "id",
+        "scan_id",
+        "scanId",
+        "created_at",
+        "createdAt",
+        "updated_at",
+        "updatedAt",
+        "statistics",
+    }
+    spec = {key: copy.deepcopy(value) for key, value in item.items() if key not in runtime_keys}
+    spec.setdefault("name", name)
+    live = {key: copy.deepcopy(value) for key, value in item.items() if key in runtime_keys and key in item}
+    return {
+        "apiVersion": "zadig.storehub.io/v1alpha1",
+        "kind": "CodeScan",
+        "metadata": {
+            "project": project,
+            "name": name,
+        },
+        "spec": spec,
+        "live": live,
+    }
 
 
 def load_data(path: Path) -> Any:
@@ -580,6 +622,22 @@ def desired_environment_service_files(path: Path, env_name: str = "") -> list[Pa
             if item.is_file() and item.name != "index.yaml"
         )
     return sorted(item for item in path.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
+def desired_code_scan_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    items_dir = path / "items" if (path / "items").is_dir() else path
+    return sorted(item for item in items_dir.glob("*.yaml") if item.is_file() and item.name != "index.yaml")
+
+
+def code_scan_document_from_file(path: Path) -> dict[str, Any]:
+    data = load_data(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"code scan file {path} must contain a mapping")
+    if data.get("kind") != "CodeScan":
+        raise ValueError(f"code scan file {path} must have kind: CodeScan")
+    return data
 
 
 async def live_build_names(project: str) -> set[str]:
@@ -1230,7 +1288,38 @@ def split_snapshot(snapshot: dict[str, Any], output_dir: Path, output_format: st
         write_data(project_dir / "tests" / data_filename("index", output_format), snapshot["tests"], output_format)
 
     if "code_scans" in snapshot:
-        write_data(project_dir / "code-scans" / data_filename("index", output_format), snapshot["code_scans"], output_format)
+        code_scans = snapshot["code_scans"] if isinstance(snapshot["code_scans"], dict) else {}
+        scan_items = code_scans.get("items") if isinstance(code_scans.get("items"), list) else []
+        index_items = []
+        for index, item in enumerate(scan_items):
+            if not isinstance(item, dict):
+                continue
+            name = code_scan_name(item, index)
+            index_items.append(
+                {
+                    "name": name,
+                    "file": f"items/{data_filename(safe_name(name), output_format)}",
+                    "id": first_present(item, "id", "scan_id", "scanId"),
+                    "repository_count": len(item.get("repos") or item.get("repositories") or []),
+                }
+            )
+            write_data(
+                project_dir / "code-scans" / "items" / data_filename(safe_name(name), output_format),
+                code_scan_gitops_document(str(project), item, index),
+                output_format,
+            )
+        index_items.sort(key=lambda item: str(item["name"]))
+        write_data(
+            project_dir / "code-scans" / data_filename("index", output_format),
+            {
+                "apiVersion": "zadig.storehub.io/v1alpha1",
+                "kind": "CodeScanIndex",
+                "project": str(project),
+                "count": len(index_items),
+                "items": index_items,
+            },
+            output_format,
+        )
 
     if "services" in snapshot:
         services = snapshot["services"] if isinstance(snapshot["services"], dict) else {}
@@ -1459,6 +1548,11 @@ async def run_apply(args: argparse.Namespace) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
+    if args.entity == "code-scan":
+        result = await run_apply_code_scan(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
     if args.entity == "service":
         result = await run_apply_service(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1535,6 +1629,84 @@ async def run_apply(args: argparse.Namespace) -> None:
         "results": results,
     }
     print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+async def run_apply_code_scan(args: argparse.Namespace) -> dict[str, Any]:
+    project = args.project
+    if args.mode == "delete" and args.code_scan and not args.file and not args.dir:
+        result = await zadig_code_scan_delete(
+            scan_name=args.code_scan,
+            project_key=project,
+            dry_run=not args.confirm,
+            confirm=args.confirm,
+        )
+        return {
+            "project_key": project,
+            "entity": "code-scan",
+            "dry_run": not args.confirm,
+            "confirm": args.confirm,
+            "desired_file_count": 0,
+            "results": [result],
+        }
+    if not args.file and not args.dir:
+        raise ValueError("--file or --dir is required for code-scan apply")
+    if args.mode == "delete" and not args.code_scan and not args.file:
+        raise ValueError("--code-scan or --file is required for code-scan delete mode")
+
+    target_path = Path(args.file or args.dir).expanduser().resolve()
+    files = desired_code_scan_files(target_path)
+    if not files and args.mode != "delete":
+        raise ValueError(f"no code scan YAML files found under {target_path}")
+
+    results = []
+    for scan_file in files:
+        document = code_scan_document_from_file(scan_file)
+        scan_name = args.code_scan or code_scan_name_from_payload(document)
+        if not scan_name:
+            raise ValueError(f"code scan file {scan_file} must contain metadata.name or spec.name")
+        if args.code_scan and scan_name != args.code_scan:
+            continue
+        if args.diff:
+            results.append(
+                await zadig_code_scan_diff(
+                    scan=document,
+                    scan_name=scan_name,
+                    project_key=project,
+                )
+            )
+        elif args.mode == "delete":
+            results.append(
+                await zadig_code_scan_delete(
+                    scan_name=scan_name,
+                    project_key=project,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                )
+            )
+        else:
+            results.append(
+                await zadig_code_scan_apply(
+                    scan=document,
+                    scan_name=scan_name,
+                    project_key=project,
+                    mode=args.mode,
+                    dry_run=not args.confirm,
+                    confirm=args.confirm,
+                    allow_redacted=args.allow_redacted,
+                )
+            )
+
+    if args.code_scan and not results:
+        raise ValueError(f"no matching code scan file found under {target_path}")
+    return {
+        "project_key": project,
+        "entity": "code-scan",
+        "dry_run": not args.confirm,
+        "confirm": args.confirm,
+        "target_path": str(target_path),
+        "desired_file_count": len(files),
+        "results": results,
+    }
 
 
 def resolve_project_file(args: argparse.Namespace) -> Path | None:
@@ -2083,7 +2255,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "entity",
         nargs="?",
-        choices=["workflow", "service", "project", "build", "template", "environment", "environment-service"],
+        choices=["workflow", "service", "project", "build", "template", "environment", "environment-service", "code-scan"],
         default="workflow",
         help="Entity type to apply or plan.",
     )
@@ -2092,6 +2264,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--service", help="Service name filter for service apply.")
     apply.add_argument("--build", help="Build name filter for build apply/delete.")
     apply.add_argument("--template", help="Build template name or id filter for template apply/delete.")
+    apply.add_argument("--code-scan", help="Code scan name filter for code-scan apply/delete.")
     apply.add_argument("--environment", help="Environment name/key filter for environment apply/delete.")
     apply.add_argument("--file", help="Workflow or service YAML/JSON file.")
     apply.add_argument("--dir", help="Directory containing item YAML files, for example projects/<project>/services or templates/build-templates.")
