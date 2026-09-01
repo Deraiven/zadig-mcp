@@ -1265,6 +1265,13 @@ async def zadig_workflow_apply(
 
     diff_result = await zadig_workflow_diff(workflow_name, workflow, project)
     payload = prepare_workflow_payload(workflow_name, project, workflow)
+    if action == "update":
+        current_payload = await client().request(
+            "GET",
+            f"/openapi/workflows/custom/{path_name(workflow_name)}/detail",
+            project_key=project,
+        )
+        payload = restore_redacted_placeholders(payload, current_payload)
 
     if dry_run or not confirm:
         return {
